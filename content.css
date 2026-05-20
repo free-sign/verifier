@@ -1,0 +1,575 @@
+/* content.css — long-form public pages (compare/, guides/, /faq, /imprint)
+   Pages link both /main.css (atoms + landing) AND /content.css (page-specific).
+   Split out of main.css 2026-05-18 to keep main.css under the modularity threshold.
+   ============================================================ */
+
+/* ============================================================
+   Shared long-form typography. .compare, .guide, .faq used to each
+   repeat this h1/h2/h3/p block — collapsed to one ruleset. The
+   per-page classes below now only set layout (max-width + padding).
+   ============================================================ */
+.compare,
+.guide,
+.faq {
+  margin: 0 auto;
+  padding: var(--space-6) 0 var(--space-8);
+}
+
+/* Long body paragraphs still cap to ~75ch so lines stay readable on
+   wide screens — but headings, tables, callouts, code blocks, and the
+   tech-details section span the full .shell width like the home page. */
+.compare > p,
+.guide > p,
+.faq > p,
+.faq-section > p,
+.faq-section > ol,
+.faq-section > ul,
+.compare > ul,
+.compare > ol {
+  max-width: 75ch;
+}
+
+.compare h1,
+.guide h1,
+.faq h1 {
+  margin: var(--space-2) 0 var(--space-4);
+  font-size: var(--fs-h1);
+  line-height: var(--lh-tight);
+}
+
+.compare h2,
+.guide h2,
+.faq h2 {
+  margin: var(--space-7) 0 var(--space-4);
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-h2);
+  line-height: 1.2;
+}
+
+.compare h3,
+.guide h3,
+.faq h3 {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: var(--fs-h3);
+  line-height: 1.3;
+}
+
+.compare p,
+.guide p,
+.faq p {
+  margin: 0 0 var(--space-3);
+  color: var(--muted);
+  line-height: var(--lh-relaxed);
+}
+
+.compare .lede,
+.guide .lede,
+.faq .lede {
+  font-size: var(--fs-lg);
+  margin-bottom: var(--space-5);
+}
+
+.compare ul,
+.guide ul,
+.faq ul,
+.compare ol,
+.guide ol,
+.faq ol {
+  margin: 0 0 var(--space-4);
+  padding-left: 22px;
+  color: var(--muted);
+  line-height: var(--lh-relaxed);
+}
+
+.compare li,
+.guide li,
+.faq li {
+  margin-bottom: var(--space-1);
+}
+
+/* ============================================================
+   /compare/ subpages: hub + per-competitor side-by-side tables
+   ============================================================ */
+
+.compare-hub-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin: 24px 0 16px;
+}
+
+.compare-hub-card {
+  background: var(--line);
+  border-radius: 10px;
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+}
+
+.compare-hub-card h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.compare-hub-card p {
+  margin: 0 0 14px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.compare-hub-card-cta {
+  margin-top: auto;
+  font-weight: 720;
+  color: var(--accent);
+  border-bottom: 1px solid var(--accent);
+  align-self: flex-start;
+  font-size: 14px;
+}
+
+.compare-table-wrap {
+  overflow-x: auto;
+  margin: 18px 0 24px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.compare-table th,
+.compare-table td {
+  text-align: left;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.compare-table thead th {
+  background: var(--bg);
+  color: var(--ink);
+  font-weight: 760;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 2px solid var(--line);
+}
+
+.compare-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.compare-table td.row-feature {
+  color: var(--ink);
+  font-weight: 720;
+  width: 36%;
+}
+
+/* Cell tone is semantic: green = an advantage for that column, red = a
+   disadvantage, amber = partial/caveated — NOT the literal yes/no answer.
+   "No document upload" is an advantage, so it gets cell-good (green). */
+.compare-table td.cell-good::before {
+  content: "✓ ";
+  color: var(--accent);
+  font-weight: 800;
+}
+
+.compare-table td.cell-bad::before {
+  content: "✕ ";
+  color: #b91c1c;
+  font-weight: 800;
+}
+
+.compare-table td.cell-mixed::before {
+  content: "~ ";
+  color: #b45309;
+  font-weight: 800;
+}
+
+.compare-table td .cell-note {
+  display: block;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 400;
+  margin-top: 2px;
+}
+
+.compare-table caption {
+  caption-side: bottom;
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+  text-align: left;
+}
+
+.compare-verdict {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 18px 0 8px;
+}
+
+.compare-verdict article {
+  background: var(--line);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+
+.compare-verdict h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.compare-verdict p {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.compare-howto {
+  margin: 18px 0 8px;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.compare-howto li {
+  position: relative;
+  padding: 4px 0 14px 36px;
+  counter-increment: step;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.compare-howto li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 2px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  display: grid;
+  place-items: center;
+  font-weight: 760;
+  font-size: 13px;
+}
+
+
+.compare-cta {
+  margin-top: 32px;
+  padding: 20px 22px;
+  background: #f1faf4;
+  border: 1px solid #bed5c8;
+  border-radius: 10px;
+}
+
+.compare-cta h3 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.compare-cta p {
+  margin: 0 0 12px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.compare-cta a.button {
+  text-decoration: none;
+}
+
+.compare-faq {
+  margin-top: 24px;
+}
+
+.compare-faq h3 {
+  font-size: 15px;
+  margin: 18px 0 4px;
+}
+
+.compare-faq p {
+  font-size: 13.5px;
+  margin: 0 0 8px;
+}
+
+/* ============================================================
+   Landing page "bands" — three explainer columns under the hero.
+   ============================================================ */
+.bands {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-5);
+  padding: var(--space-5) 0 var(--space-8);
+}
+
+.bands article {
+  border-top: 1px solid var(--line);
+  padding-top: var(--space-4);
+}
+
+/* ============================================================
+   /faq — layout-only rules (typography comes from the shared block).
+   ============================================================ */
+.faq-toc {
+  margin: 22px 0 8px;
+  padding: 16px 20px;
+  background: var(--line);
+  border-radius: 8px;
+}
+
+.faq-toc ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.faq-toc li {
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.faq-toc a {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--muted);
+}
+
+.faq-toc a:hover {
+  border-bottom-style: solid;
+}
+
+.faq-section {
+  scroll-margin-top: 24px;
+}
+
+.faq-section > h2:first-child {
+  margin-top: 56px;
+  border-top: 1px solid var(--line);
+  padding-top: 36px;
+}
+
+.faq-section h4 {
+  margin: var(--space-5) 0 var(--space-2);
+  font-size: var(--fs-md);
+}
+
+.faq-tech-pointer {
+  margin: var(--space-5) 0 0 !important;
+  padding: var(--space-3) var(--space-4);
+  background: #fbfaf7;
+  border: 1px dashed var(--line);
+  border-radius: var(--rd-md);
+  font-size: var(--fs-sm) !important;
+  font-style: italic;
+}
+
+.faq-callouts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 28px 0 8px;
+}
+
+.faq-callouts article {
+  background: var(--line);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+
+.faq-callouts h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.faq-callouts p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.faq-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.faq-steps > li {
+  border-top: 1px solid var(--line);
+  padding-top: 20px;
+  margin-top: 20px;
+}
+
+.faq-steps > li:first-child {
+  border-top: 0;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+.faq-note {
+  font-size: 12.5px;
+  font-style: italic;
+  background: #fef3c7;
+  color: #78350f;
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-top: 8px !important;
+}
+
+.faq-adobe {
+  margin: 32px 0 40px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.faq-adobe-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  background: linear-gradient(180deg, #fffbeb 0%, #fef3c7 100%);
+  border-bottom: 1px solid #fcd34d;
+}
+
+.faq-adobe-banner svg {
+  flex-shrink: 0;
+}
+
+.faq-adobe-banner > div {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.faq-adobe-banner-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: #78350f;
+}
+
+.faq-adobe-banner-sub {
+  margin: 0;
+  font-size: 11px;
+  font-style: italic;
+  color: #92400e;
+}
+
+.faq-adobe-banner-button {
+  flex-shrink: 0;
+  border: 1px solid #92400e;
+  background: #fff;
+  color: #78350f;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: default;
+  pointer-events: none;
+}
+
+.faq-adobe-body {
+  padding: 22px 24px 6px;
+}
+
+.faq-adobe-body h3 {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 18px;
+}
+
+.faq-adobe-body h4 {
+  margin: 24px 0 8px;
+  font-size: 15px;
+}
+
+.faq-adobe-quote {
+  border-left: 3px solid #fcd34d;
+  padding: 4px 0 4px 14px;
+  margin: 12px 0 !important;
+  font-style: italic;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.faq-adobe-checks {
+  margin: 8px 0 14px;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.7;
+}
+
+.faq-adobe-checks li {
+  margin-bottom: 2px;
+}
+
+.faq-adobe-checks li::marker {
+  content: "✓ ";
+  color: #059669;
+  font-weight: 700;
+}
+
+.faq-adobe-bottom {
+  background: #f1f5f9;
+  border-radius: 6px;
+  padding: 12px 14px;
+  font-size: 13.5px !important;
+  color: var(--ink) !important;
+  margin: 16px 0 4px !important;
+}
+
+.faq-bullets {
+  color: var(--muted);
+  line-height: 1.65;
+  padding-left: 20px;
+}
+
+.faq-bullets li {
+  margin-bottom: 6px;
+}
+
+.faq-tiers {
+  color: var(--muted);
+  line-height: 1.65;
+  padding-left: 22px;
+  margin: 8px 0 14px;
+}
+
+.faq-tiers li {
+  margin-bottom: 10px;
+}
+
+.faq-tiers li strong:first-child {
+  color: var(--ink);
+}
+
+.faq abbr {
+  border-bottom: 1px dotted var(--muted);
+  cursor: help;
+  text-decoration: none;
+}
+
+.nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+
+/* responsive: content-page grids collapse on narrow viewports. */
+@media (max-width: 860px) {
+  .compare-hub-grid { grid-template-columns: 1fr; }
+  .compare-verdict { grid-template-columns: 1fr; }
+  .compare-table th, .compare-table td { padding: 9px 10px; font-size: 12.5px; }
+}
