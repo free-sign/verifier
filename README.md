@@ -1,268 +1,189 @@
 # FreeSign Verifier
 
-The open-source, client-side verifier for [FreeSign](https://free-sign.com)
+The open-source verifier **library** for [FreeSign](https://free-sign.com)
 signed PDFs.
 
-This repository contains the **exact verification code** served at
-**[free-sign.com/verify](https://free-sign.com/verify)** — published so that
-anyone can read it, audit it, run it offline, and check a FreeSign-signed PDF
+This repository contains the **exact verification code** that runs at
+**[free-sign.com/verify](https://free-sign.com/verify)** — published so anyone
+can read it, audit it, and run it offline to check a FreeSign-signed PDF
 **without trusting the FreeSign service at all**.
 
-It runs **100% in your browser**. No upload, no backend, no account, no
-telemetry. The PDF you check never leaves your machine.
+It is a dependency-free ES-module library: no UI, no framework, no install step.
+It runs unchanged in a browser and in Node ≥ 18 (both provide the WebCrypto,
+`fetch`, `btoa` and `AbortSignal.timeout` globals it uses). The PDF you check
+never leaves your machine.
+
+> **This is a generated mirror.** The library files (`verify.js`,
+> `ots-timestamp.js`, `audit-verify.js`, `session.js`) are copied **byte-for-byte**
+> from the FreeSign codebase that serves `/verify` — so the code you audit here is
+> the code that actually checks signatures. **Do not edit them here**; fixes go
+> upstream and are re-published. Only the `examples/` and this README are
+> repo-specific.
 
 ---
 
-## Why this is open source
-
-FreeSign's hosted *signing* service is closed-source. The **verification path is
-not** — and that split is deliberate.
-
-The whole point of a FreeSign signature is that its validity does **not** depend
-on trusting FreeSign. That promise is only credible if the code that *checks* the
-signature is something you can read, audit and run yourself. This repository is
-that code.
-
-You do not even strictly need this verifier: a FreeSign signed PDF is a standard
-**PAdES-B-T** document that Adobe Reader, `openssl` and `pyHanko` also verify
-(see [Cross-check with other tools](#cross-check-with-other-tools)). This verifier
-simply makes the *full* check — including the FreeSign-specific evidence record
-and audit chain — a single drag-and-drop, with no software to install.
-
----
-
-## Quick start
+## Quick start (Node)
 
 ```sh
 git clone https://github.com/free-sign/verifier.git
 cd verifier
-python3 -m http.server 8000
-# then open http://localhost:8000/verify.html and drop in a signed PDF
+node examples/verify-pdf.mjs path/to/signed.pdf
 ```
 
-Browser ES modules require an HTTP origin, so a static file server is needed
-(`file://` will not work). Any static server does — `python3 -m http.server`,
-`npx serve`, `caddy file-server`, etc.
+No `npm install` — the library has **zero dependencies**. You need only Node ≥ 18.
 
-**Nothing is sent anywhere.** Open DevTools → Network and watch: once the page
-has loaded, verifying a PDF makes **zero** network requests. You can also unplug
-from the network entirely and it still works.
+```
+Signatures found: 1
 
-Prefer not to clone? The identical code runs at
-[free-sign.com/verify](https://free-sign.com/verify).
+Signature 1 — Jane Doe <jane@example.com>
+  CMS signature        ✓ ok
+  Certificate chain    ✓ ok
+  RFC 3161 timestamp   ✓ ok
+  OpenTimestamps       ✓ ok
+  Embedded evidence    ✓ ok
+  ...
+PASS: every signature is cryptographically intact (CMS + certificate chain).
+```
+
+Re-derive the tamper-evident audit chain yourself:
+
+```sh
+# from a saved API response or a bare events array:
+node examples/verify-audit-chain.mjs events.json
+# or pull it live (raw + unauthenticated by design):
+node examples/verify-audit-chain.mjs --envelope env_0123…  --base https://free-sign.com
+```
+
+The same files also load directly in a browser as ES modules (`import` from
+`verify.js`); this repo just ships them without a page wrapped around them.
+
+---
+
+## Library API
+
+```js
+import { extractSignatures, verifySignature } from "./verify.js";
+import { verifyAuditChain } from "./audit-verify.js";
+
+const bytes = new Uint8Array(/* the PDF */);
+const sigs = extractSignatures(bytes);          // one entry per CMS signature
+for (const sig of sigs) {
+  const result = await verifySignature(sig);
+  // result.checks.{cms,chain,tst,ots,evidence} → { state, ok, detail }
+  // result.summary.{signerName,signerEmail,signingTime,cmsProfile,caSubject,…}
+}
+
+// Audit chain (events from GET /api/envelopes/{id}/audit):
+const verdict = await verifyAuditChain(events, attestedHeadHash /* optional */);
+// → { valid, event_count, broken_at, reason, head_checked, head_match, events }
+```
+
+`verify.js` also exports the lower-level primitives it is built from (`parseCms`,
+`parseCertificate`, the OID/algorithm tables, the OpenTimestamps helpers
+`evaluateEmbeddedOtsProof` / `findBitcoinAttestation`, and the WebAuthn assertion
+verifier) for callers that want to inspect a signature piece by piece. See the
+source — it is short and commented.
+
+**Integrity vs. trust — two separate verdicts.** `cms` + `chain` answer *is the
+maths valid and the document unmodified?* — a pure cryptographic fact. They do
+**not** depend on whether your software already trusts the FreeSign CA. FreeSign
+runs its own CA, which is **not** on the Adobe Approved Trust List, so Adobe
+Reader shows a yellow banner by default — a *trust-list* statement, not an
+*integrity* failure. A FreeSign signature can be cryptographically perfect and
+still show "not trusted" until you add the FreeSign CA to your trust store.
 
 ---
 
 ## What it verifies
 
-Drop in a signed PDF and the verifier reports, **for each signature** in the file:
+For **each signature** in the PDF:
 
 | Check | What it establishes |
 |-------|---------------------|
-| **PDF revisions** | Each signature covers a genuine incremental-update revision; any later change to the file appears as a separate, attributable revision rather than silently altering signed content. |
-| **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — the document content has not been modified since signing. |
-| **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA. |
-| **Signer identity** | The signer's typed legal name (certificate Subject CN) and OTP-verified e-mail address (certificate Subject Alternative Name). |
+| **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — content unmodified since signing. |
+| **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
 | **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
-| **OpenTimestamps proof** | An independent timestamp anchored into the Bitcoin blockchain's block headers — datable even if FreeSign and DigiCert both vanish. |
-| **Embedded evidence record** | The consent text, identity method (OTP or passkey), canonical signed payload and request fingerprint that FreeSign embedded inside the signature. |
-| **Audit hash chain** | The per-document tamper-evident event log replays consistently — every event is hash-chained to the previous one. |
-| **Dual signature** | The same browser-held key signed both the *intent* payload and the *final* PDF — a post-consent swap of the file is detectable. |
+| **OpenTimestamps proof** | An independent timestamp anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert both vanish. When the embedded proof is still calendar-only, the verifier queries public OTS calendars for the Bitcoin upgrade before reporting. |
+| **Embedded evidence record** | The consent text, identity method (OTP or passkey), canonical signed payload and request fingerprint FreeSign embedded inside the signature (CMS unsigned attribute under PEN `1.3.6.1.4.1.65834`). |
+| **Audit hash chain** | `verifyAuditChain` replays the per-document event log; every event is hash-chained to the previous one, and the optional attested head catches a re-forged but internally consistent chain. |
 
-### Integrity vs. trust — two separate verdicts
-
-The verifier deliberately separates two questions that consumer PDF readers tend
-to blur together:
-
-- **Integrity** — *is the maths valid and the document unmodified?* This is a
-  pure cryptographic fact. It does not depend on anyone's opinion.
-- **Trust** — *is the issuing CA one your software already trusts?* FreeSign runs
-  its own CA, which is **not** on the Adobe Approved Trust List (AATL). So Adobe
-  Reader shows a yellow banner by default — that is a *trust-list* statement, not
-  an *integrity* failure.
-
-A FreeSign signature can be **cryptographically perfect** (integrity ✓) and still
-show as "not trusted" until you add the FreeSign CA to your local trust store.
-The verifier shows both verdicts so you are never misled by a single colour.
-
----
-
-## The FreeSign signing & cryptography model
-
-This section explains, at the level a security reviewer needs, how a FreeSign
-signature is produced and what each part guarantees. It describes only the
-**public, standards-based design** — see
-[What is deliberately not here](#what-is-deliberately-not-in-this-repository).
-
-### 1. The document never leaves your browser
-
-The PDF is hashed **locally**, in the browser, with the WebCrypto API. Only the
-resulting 32-byte SHA-256 digests are ever sent to the server — never the
-document bytes. There is no upload endpoint; the API and the MCP contract both
-advertise `documentUpload: false`. The server is structurally incapable of
-reading what you signed.
-
-### 2. Signer identity
-
-Identity is established by **e-mail one-time-passcode (OTP)**: the signer proves
-control of an inbox at signing time. Optionally, a **WebAuthn passkey** can be
-enrolled as an additional identity factor (Touch ID / Windows Hello / a security
-key). The passkey is an *identity* layer only — it is **not** the key that signs
-the PDF — and FreeSign only ever stores its public half.
-
-### 3. The browser-held evidence key
-
-At the start of a signing session the browser generates a **non-extractable
-ECDSA P-256 key pair** and stores it in IndexedDB. It cannot be exported by
-script. Every privileged request in the ceremony is signed with it
-(envelope-scoped session binding), and its public half is recorded as evidence.
-This proves the whole ceremony ran in one consistent browser context.
-
-### 4. The seal — PAdES-B-T / CMS PKCS#7
-
-When the document is sealed, the server-side ceremony:
-
-1. generates a **fresh, ephemeral ECDSA P-256 key pair** for this one signature —
-   it is never written to disk, never returned, and is destroyed when the
-   ceremony ends;
-2. issues a per-signature **X.509 leaf certificate** for that key under the
-   FreeSign signing CA, with the signer's typed name in the Subject and the
-   verified e-mail in the Subject Alternative Name;
-3. signs the PDF's signed attributes (the `ByteRange` digest, signing time, and a
-   `signingCertificateV2` binding) producing a **CMS PKCS#7** signature
-   (RFC 5652, ECDSA-with-SHA-256);
-4. requests an **RFC 3161 timestamp token** from a public timestamp authority
-   (DigiCert) and embeds it — upgrading the signature to **PAdES-B-T**;
-5. assembles the CMS with the leaf and CA certificates included, and writes it
-   into the PDF as an **incremental update** (the original bytes are never
-   rewritten).
-
-The output is a standard signed PDF. Nothing about it is proprietary.
-
-### 5. The certificate authority (HSM-backed)
-
-The FreeSign signing CA's private key lives in a **hardware security module** —
-Google Cloud KMS, FIPS 140-2 Level 3. It is non-exportable. The HSM signs only
-the digest of each leaf certificate's to-be-signed block; it never sees the PDF,
-the signature, or any personal data. The CA certificate itself is public:
-
-- PEM: <https://free-sign.com/.well-known/free-sign-signing-ca.pem>
-- SHA-256 fingerprint: <https://free-sign.com/.well-known/free-sign-signing-ca.sha256.txt>
-
-Publishing the fingerprint lets you pin exactly which CA is allowed to have
-issued the certificate in your document.
-
-### 6. Independent timestamps
-
-Signing time is anchored **twice, by parties unrelated to FreeSign**:
-
-- an **RFC 3161** token from DigiCert's timestamp authority, embedded in the CMS;
-- an **OpenTimestamps** proof, which settles into the **Bitcoin** blockchain's
-  block headers. Even if FreeSign *and* DigiCert disappeared, an OpenTimestamps
-  proof remains independently checkable against public block headers with the
-  `ots` CLI.
-
-### 7. Two signatures, not one
-
-Every envelope carries **two** ECDSA signatures from the browser-held key:
-
-- a **primary** signature over the canonical *intent* payload (what you agreed
-  to, before the PDF was stamped);
-- a **final** signature over the *final* payload, which includes the hash of the
-  finished PDF.
-
-Because the same key signs both, an attacker who controlled the network between
-your browser and the server still could not swap the final PDF after you
-consented — the final signature would not match.
-
-### 8. The tamper-evident audit chain
-
-Every step (envelope creation, OTP request, OTP verification, signing, sealing,
-finalisation) is recorded as an event whose hash includes the hash of the
-previous event. Altering or removing any one event breaks every later hash. The
-verifier replays this chain and reports whether it is intact.
-
-### 9. The embedded evidence record
-
-FreeSign embeds a JSON **evidence record** inside the signature's CMS as an
-unsigned attribute, under FreeSign's IANA Private Enterprise Number
-(`1.3.6.1.4.1.65834`). It carries the consent text, identity method, canonical
-signed payload, public key and request fingerprint — so a multi-signer PDF
-carries every signer's evidence, travelling with the file itself. Its schema is
-public: <https://free-sign.com/guides/evidence-json-schema>.
-
-### 10. Long-term validation
-
-When the deployment publishes a CA revocation list, the seal additionally gets a
-**PAdES-B-LT** revision (a `/DSS` dictionary with the certificate and revocation
-material), so the file keeps verifying even after the leaf certificate's validity
-window eventually elapses.
+For the full signing & cryptography model (ephemeral leaf certs under an
+HSM-backed CA, the two browser-held signatures, PAdES-B-LT/DSS long-term
+validation), see **[free-sign.com/trust](https://free-sign.com/trust)**.
 
 ---
 
 ## Trust model & honest limitations
 
-We would rather you verify than assume — so, plainly:
-
-- **Not a Qualified Electronic Signature (QES).** A FreeSign signature is an
-  electronic signature valid under the US ESIGN Act / UETA and is built to the EU
-  eIDAS **advanced** electronic signature (AES) evidence model. It is **not** a
-  QES, and the operator is not a Qualified Trust Service Provider. For documents
-  that legally require QES or notarisation, FreeSign is not the right tool.
-- **Not on the Adobe Approved Trust List (AATL).** Adobe Reader shows a yellow
-  trust banner by default. That is trust-list membership, not document integrity.
-- **The hosted service is closed-source and offered best-effort**, with no
-  warranty and no third-party SOC/ISO audit published yet. This *verifier* is
-  open source precisely so that the security-critical half does not require you
-  to take anyone's word for it.
+- **Not a Qualified Electronic Signature (QES).** A FreeSign signature is valid
+  under the US ESIGN Act / UETA and built to the EU eIDAS **advanced** electronic
+  signature (AES) evidence model. It is **not** a QES, and the operator is not a
+  Qualified Trust Service Provider.
+- **Not on the Adobe AATL.** Adobe Reader shows a yellow trust banner by default
+  — trust-list membership, not document integrity.
+- **The hosted signing service is closed-source**, best-effort, no warranty, no
+  third-party SOC/ISO audit published yet. This *verifier* is open source
+  precisely so the security-critical half needs no one's word.
 - **The verifier checks cryptography, not law.** A valid signature is evidence;
-  whether a given document is legally effective depends on context and
-  jurisdiction. Nothing here is legal advice.
-
-More: [free-sign.com/trust](https://free-sign.com/trust) ·
-[free-sign.com/faq](https://free-sign.com/faq)
+  legal effect depends on context and jurisdiction. Not legal advice.
 
 ---
 
 ## Cross-check with other tools
 
-This verifier should never be your *only* check if the stakes are high. A
-FreeSign PDF is a standard signed PDF, so independent tools agree:
+A FreeSign PDF is a standard PAdES-B-T document, so independent tools agree.
+
+**OpenSSL** can't read a PDF directly (`-inform` accepts only DER/PEM/SMIME, not
+`PDF`). You must first extract the embedded CMS/PKCS#7 from the signature dict and
+the signed ByteRange content, then verify the detached signature over that
+content — exactly what `tools/validate-sealed-pdf.mjs` does in this codebase:
 
 ```sh
-# CMS signature (integrity) — OpenSSL
-openssl cms -verify -in signed.pdf -inform PDF -noverify   # structural check
-
-# PAdES validation — pyHanko
-pyhanko sign validate --pretty-print signed.pdf
-
-# OpenTimestamps proof — official CLI, against public Bitcoin block headers
-ots verify signed.pdf.ots
+# After extracting the CMS blob to sig.der and the signed bytes to content.bin
+# (see the walkthrough for the extraction step):
+openssl cms -verify -in sig.der -inform DER -content content.bin -noverify   # CMS structural + content match
 ```
 
-A step-by-step, vendor-independent walkthrough:
+Full extract-then-verify walkthrough:
 <https://free-sign.com/guides/verify-signed-pdf-with-openssl>
+
+```sh
+pyhanko sign validate --pretty-print signed.pdf            # PAdES validation
+```
+
+**OpenTimestamps:** the embedded FreeSign `.ots` proof commits to the signature's
+**ByteRange SHA-256** (the bytes the CMS signs), **not** to `SHA-256(signed.pdf)`.
+So a bare `ots verify signed.pdf.ots` verifies the wrong digest and will not
+match. Fetch the proof from the receipt's proof URL
+(`/api/envelopes/{id}/proof.ots`) and verify it against the ByteRange digest the
+verifier reports (`result.summary.byteRangeSha256`):
+
+```sh
+# Verify the OTS proof against the ByteRange digest (hex), not the whole file:
+ots verify -d <byteRangeSha256-hex> proof.ots
+```
+
+The Node example (`verify-pdf.mjs`) already evaluates the embedded proof for you
+against the correct digest; the CLI above is only for an independent cross-check.
 
 ---
 
 ## What is deliberately not in this repository
 
-This repo is the **verifier** — the client-side, read-only checker. It is the
-complete trust-critical path and it needs nothing else.
+The verifier is the complete trust-critical path and needs nothing else. It does
+**not** contain the FreeSign server, the signing-ceremony backend, any secret or
+key material, or operational internals. Verification relies only on public
+standards (PAdES, CMS, X.509, RFC 3161, OpenTimestamps) and the **published**
+FreeSign CA certificate:
 
-It deliberately does **not** contain the FreeSign server, the signing-ceremony
-backend, any secret or key material, or operational internals (rate-limiting
-thresholds, abuse heuristics, infrastructure configuration). None of that is
-required to verify a signature — verification relies only on public standards
-(PAdES, CMS, X.509, RFC 3161, OpenTimestamps) and the **published** FreeSign CA
-certificate. Omitting it keeps this repository safe to publish without handing an
-attacker a map.
+- PEM: <https://free-sign.com/.well-known/free-sign-signing-ca.pem>
+- SHA-256: <https://free-sign.com/.well-known/free-sign-signing-ca.sha256.txt>
 
 ---
 
 ## Reporting a problem
 
-- **Security issues:** see <https://free-sign.com/.well-known/security.txt>
+- **Security issues:** <https://free-sign.com/.well-known/security.txt>
 - **General contact:** support@coderai.dev
 
 If this verifier ever reports a FreeSign-signed PDF as valid when it is not — or

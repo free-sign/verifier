@@ -2,10 +2,12 @@
 // five evidence checks: CMS signature, certificate chain, RFC 3161 timestamp,
 // OpenTimestamps Bitcoin anchor, and an explanation of Adobe AATL.
 //
-// Privacy invariant: the PDF bytes never leave the browser. The only network
-// call this script makes is an optional GET to blockstream.info to resolve a
-// Bitcoin block height to a block hash for display — the document hash itself
-// is already in the .ots proof, not in that request.
+// Privacy invariant: the PDF bytes never leave the browser. Network calls are
+// limited to (1) optional GETs to allowlisted OpenTimestamps calendar hosts
+// when upgrading an embedded calendar-only proof, and (2) an optional GET to
+// blockstream.info to resolve a Bitcoin block height for display. The document
+// hash is not sent to those services beyond the OTS commitment path already
+// embedded in the PDF.
 //
 // Format references:
 //   PDF 32000-1:2008 §12.8 (signature dictionary, ByteRange)
@@ -16,6 +18,7 @@
 // must canonicalize the embedded evidence's canonical_payload byte-identically
 // to how the browser signed it.
 import { canonicalJson } from "./session.js";
+import { upgradeTimestampFromTree } from "./ots-timestamp.js";
 
 // -----------------------------------------------------------------------------
 // OID constants — kept byte-identical with the server-side CMS module.
@@ -109,6 +112,16 @@ const OTS_MAGIC = new Uint8Array([
   0xbf, 0x89, 0xe2, 0xe8, 0x84, 0xe8, 0x92, 0x94,
 ]);
 const BTC_ATTESTATION_TAG = new Uint8Array([0x05, 0x88, 0x96, 0x0d, 0x73, 0xd7, 0x19, 0x01]);
+const OTS_OP_SHA256 = 0x08;
+// After this age, calendar-only embedded proof + failed live upgrade → INFO,
+// not the hourglass "on its way" copy (production PDFs embed the calendar
+// response at /seal time; Bitcoin confirmation arrives later via upgrade).
+const OTS_STALE_AFTER_SIGNING_MS = 3 * 60 * 60 * 1000;
+const DEFAULT_OTS_CALENDARS = [
+  "https://a.pool.opentimestamps.org",
+  "https://b.pool.opentimestamps.org",
+  "https://finney.calendar.eternitywall.com",
+];
 
 // -----------------------------------------------------------------------------
 // Bytes / hex / base64.
@@ -1445,6 +1458,24 @@ function parseSigDictField(dictText, key) {
   return null;
 }
 
+// Parse a /Key entry whose value is a PDF name (e.g. /SubFilter /adbe.pkcs7.detached).
+// Names run until whitespace or a delimiter; we don't decode #xx escapes since the
+// names we care about (SubFilter values) never contain them.
+function parseSigDictName(dictText, key) {
+  const keyMarker = "/" + key;
+  let i = dictText.indexOf(keyMarker);
+  while (i !== -1) {
+    let j = i + keyMarker.length;
+    while (j < dictText.length && /\s/.test(dictText[j])) j += 1;
+    if (dictText[j] === "/") {
+      const m = /^[^\s/<>[\]()]+/.exec(dictText.slice(j + 1));
+      if (m) return m[0];
+    }
+    i = dictText.indexOf(keyMarker, i + 1);
+  }
+  return null;
+}
+
 function trimTrailingZeros(bytes) {
   // /Contents hex is padded with 0x00 to a fixed placeholder width. Trim by
   // reading the outer SEQUENCE's length. Handles BER indefinite-length too:
@@ -1524,6 +1555,8 @@ async function verifySignature(sig) {
       // leave tstSignedAt null; the TST check below will report the parse error
     }
   }
+  const signingTimeAttr = findAttr(si.signedAttrs, OID.signingTimeAttr);
+  const signerClaimedAt = signingTimeAttr ? decodeTime(signingTimeAttr.buf, signingTimeAttr.valueTlv) : null;
 
   // ---- Check 1: cryptographic signature (universal: RSA + ECDSA).
   // Enforces (in order): supported sigAlg, well-formed SignedAttributes,
@@ -1625,9 +1658,21 @@ async function verifySignature(sig) {
       // The signature verifies, but with NO signingCertificate(V2) attribute
       // the leaf is bound to this SignerInfo only by sid (issuer + serial) —
       // unsigned CMS metadata, weaker than a signed certificate hash. Surface
-      // it as a caveat (yellow), not a clean green.
+      // it as a caveat (yellow), not a clean green. The wording depends on the
+      // /SubFilter: ETSI.CAdES.detached *declares* PAdES, so omitting the ESS
+      // attribute is a real conformance defect; adbe.pkcs7.* is legacy Adobe
+      // PKCS#7, where signingCertificateV2 is genuinely optional — there it is
+      // "valid CMS, just not PAdES", not "broken".
       cmsState = "warn";
-      extras.push("no signingCertificate(V2) attribute present — basic CMS, not PAdES-conformant; the leaf is bound to this signature only by the unsigned SignerInfo.sid, not a signed certificate hash");
+      const subFilter = parseSigDictName(sig.sigDictText || "", "SubFilter");
+      const sidNote = "the leaf is bound to this signature only by the unsigned SignerInfo.sid (issuer + serial), not a signed certificate hash";
+      if (subFilter === "ETSI.CAdES.detached") {
+        extras.push(`SubFilter is ETSI.CAdES.detached (declares PAdES) yet carries no signingCertificate(V2) attribute — NOT PAdES-conformant (ETSI EN 319 122-1 §5.2.2 makes signingCertificateV2 mandatory); ${sidNote}`);
+      } else if (subFilter && subFilter.startsWith("adbe.")) {
+        extras.push(`legacy Adobe PKCS#7 signature (SubFilter ${subFilter}) — valid CMS, but not a PAdES signature: no signingCertificate(V2) attribute (optional for this SubFilter, mandatory for PAdES), so ${sidNote}`);
+      } else {
+        extras.push(`no signingCertificate(V2) attribute present — basic CMS, not PAdES-conformant; ${sidNote}`);
+      }
     }
     extras.push(`contentType attr = ${ctValOid}`);
     cmsDetail = `${algLabel} over SignedAttributes verifies against leaf SPKI; messageDigest attr matches ${mdHashName}(ByteRange) (${toHex(actualMd).slice(0, 16)}…); ${extras.join("; ")}.`;
@@ -1645,8 +1690,6 @@ async function verifySignature(sig) {
   let chainOk = false;
   let chainDetail = "";
   try {
-    const signingTimeAttr = findAttr(si.signedAttrs, OID.signingTimeAttr);
-    const signerClaimedAt = signingTimeAttr ? decodeTime(signingTimeAttr.buf, signingTimeAttr.valueTlv) : null;
     const selfSigned = bytesEq(leaf.issuerDer, leaf.subjectDer);
     if (selfSigned) {
       // A self-signed leaf is internally consistent at best — we explicitly
@@ -1781,56 +1824,13 @@ async function verifySignature(sig) {
     } else {
       if (otsAttr.valueTlv.tag !== 0x04) throw new Error("OTS attribute value is not OCTET STRING");
       const otsBytes = otsAttr.valueBytes;
-      if (otsBytes.length < OTS_MAGIC.length + 1 + 1 + 32) throw new Error(".ots truncated");
-      for (let i = 0; i < OTS_MAGIC.length; i += 1) {
-        if (otsBytes[i] !== OTS_MAGIC[i]) throw new Error(".ots magic mismatch");
-      }
-      // .ots layout after magic: 1 byte version, 1 byte file_hash_op tag,
-      // then the message hash. We now READ the file_hash_op (issue #21 from
-      // /cr) so a future .ots produced for a non-SHA-256 algorithm doesn't
-      // silently SHA-256-cross-check against the wrong digest.
-      const otsVersion = otsBytes[OTS_MAGIC.length];
-      const otsFileHashOp = otsBytes[OTS_MAGIC.length + 1];
-      const OTS_OP_SHA256 = 0x08;  // OpenTimestamps SHA-256 file-hash op
-      if (otsFileHashOp !== OTS_OP_SHA256) {
-        throw new Error(`.ots uses file_hash_op 0x${otsFileHashOp.toString(16)} (not SHA-256); this verifier only supports SHA-256 commitments`);
-      }
-      const msgStart = OTS_MAGIC.length + 1 + 1;
-      const otsMsg = otsBytes.slice(msgStart, msgStart + 32);
-      // The .ots commits to SHA-256 of the ByteRange specifically (FreeSign
-      // convention — independent of whatever digest the SignerInfo uses).
       const docDigest = await sha256(sig.signedRegion);
-      if (!bytesEq(otsMsg, docDigest)) throw new Error(".ots commits to a different digest than SHA-256(ByteRange) — document was modified after signing");
-      const timestampBlob = otsBytes.slice(msgStart + 32);
-      const btc = findBitcoinAttestation(timestampBlob);
-      if (btc.found) {
-        // Bitcoin attestation marker is necessary but NOT sufficient: anyone
-        // can synthesize the 8-byte tag + a fake block height in the
-        // unsignedAttribute (the .ots blob is not covered by the outer
-        // signature). The ONLY honest "green" criterion this browser
-        // verifier can give is: marker present AND block hash resolves to
-        // a real Bitcoin block (resolution is opt-in via the checkbox). For
-        // true cryptographic verification — walking the OTS op tree to a
-        // block-header merkleRoot — use `ots verify <file.ots>` offline.
-        otsBlockHash = await fetchBlockHashSilently(btc.blockHeight);
-        if (otsBlockHash) {
-          otsState = "ok";
-          otsOk = true;
-          otsDetail = `OpenTimestamps Bitcoin attestation marker found at block height ${btc.blockHeight}, block hash ${otsBlockHash} (resolved via blockstream.info). NOTE: this verifier only confirms the marker shape + that a Bitcoin block at this height exists — it does NOT walk the OTS aggregation-tree path from the document hash to the block's merkleRoot. For full cryptographic proof, run \`ots verify <file.ots>\` offline. The unsignedAttribute carrying this marker is NOT covered by the outer signature; a tampered marker by itself would not prove anything.`;
-        } else if (BLOCKSTREAM_LOOKUP_ENABLED) {
-          otsState = "info";
-          otsDetail = `OpenTimestamps Bitcoin attestation marker found at block height ${btc.blockHeight}, but blockstream.info lookup returned no block hash. Could be a fabricated marker, transient network failure, or a height not yet mined. Use \`ots verify <file.ots>\` offline for full validation.`;
-        } else {
-          otsState = "info";
-          otsDetail = `OpenTimestamps Bitcoin attestation marker found at block height ${btc.blockHeight}. Block-hash lookup against blockstream.info is OFF — without it this verifier can only confirm the marker is well-formed, not that a real block at this height exists. The marker itself is trivially forgeable; for cryptographic proof run \`ots verify <file.ots>\` offline against a Bitcoin full node.`;
-        }
-      } else {
-        // Calendar-only proof: shape is correct, msg matches, but the
-        // anchoring chain hasn't reached a Bitcoin block yet. Calendars are
-        // a trust hint, not a trust root — INFO, not OK.
-        otsState = "info";
-        otsDetail = `OpenTimestamps proof embedded (${otsBytes.length} bytes), commits to SHA-256(ByteRange). NO Bitcoin attestation marker yet — only a calendar promise. Until the calendar aggregation tree lands in a Bitcoin block (typically ~1h after signing), this proof is provisional. Run \`ots upgrade <file.ots>\` or fetch /api/envelopes/<id>/proof.ots after the upgrade window.`;
-      }
+      const signingTimeMs = tstSignedAt ? tstSignedAt.getTime() : (signerClaimedAt ? signerClaimedAt.getTime() : null);
+      const otsEval = await evaluateEmbeddedOtsProof(otsBytes, docDigest, { signingTimeMs });
+      otsState = otsEval.state;
+      otsOk = otsEval.ok;
+      otsDetail = otsEval.detail;
+      otsBlockHash = otsEval.blockHash;
     }
   } catch (e) {
     otsDetail = "FAILED: " + e.message;
@@ -1939,11 +1939,9 @@ async function verifySignature(sig) {
   }
 
   // Display fields.
-  const signingTimeAttr = findAttr(si.signedAttrs, OID.signingTimeAttr);
-  const signerClaimedTime = signingTimeAttr ? decodeTime(signingTimeAttr.buf, signingTimeAttr.valueTlv) : null;
   // PAdES: TST genTime is AUTHORITATIVE when present; signer-claimed time is
   // unattested. Display order corrected (issue #25 from /cr): TST first.
-  const displayTime = tstSignedAt || signerClaimedTime;
+  const displayTime = tstSignedAt || signerClaimedAt;
   const byteRangeDigest = await sha256(sig.signedRegion);
   const sigDict = sig.sigDictText || "";
   const sigDictName = parseSigDictField(sigDict, "Name");
@@ -1970,7 +1968,7 @@ async function verifySignature(sig) {
       signerEmail: leaf.rfc822Name || "(none in cert)",
       signerContact: sigDictContact || "(none)",
       signingTime: displayTime ? displayTime.toISOString() : "(unknown)",
-      signingTimeSource: tstSignedAt ? "TST (third-party attested)" : (signerClaimedTime ? "signer-claimed (unattested)" : "(unknown)"),
+      signingTimeSource: tstSignedAt ? "TST (third-party attested)" : (signerClaimedAt ? "signer-claimed (unattested)" : "(unknown)"),
       byteRangeSha256: toHex(byteRangeDigest),
       cmsProfile: tstOk ? "PAdES-B-T" : "PAdES-B-B",
       sigAlg: sigAlgLabel,
@@ -2050,6 +2048,92 @@ function findBitcoinAttestation(blob) {
   return { found: false };
 }
 
+/**
+ * Poll public calendars for a Bitcoin-upgraded Timestamp tree when the
+ * embedded .ots in the PDF is still calendar-only (normal at /seal time).
+ */
+async function tryUpgradeOtsTimestamp(timestampBytes, msgBytes, { fetchImpl, signal, timeoutMs } = {}) {
+  return upgradeTimestampFromTree(timestampBytes, msgBytes, { fetchImpl, signal, timeoutMs });
+}
+
+/**
+ * Evaluate an embedded FreeSign .ots blob against SHA-256(ByteRange). When the
+ * PDF carries a calendar-only proof, queries public calendars for the BTC
+ * upgrade before showing the hourglass state.
+ */
+async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTimeMs, fetchImpl, signal, timeoutMs } = {}) {
+  if (otsBytes.length < OTS_MAGIC.length + 1 + 1 + 32) throw new Error(".ots truncated");
+  for (let i = 0; i < OTS_MAGIC.length; i += 1) {
+    if (otsBytes[i] !== OTS_MAGIC[i]) throw new Error(".ots magic mismatch");
+  }
+  if (otsBytes[OTS_MAGIC.length + 1] !== OTS_OP_SHA256) {
+    throw new Error(".ots uses a non-SHA-256 file_hash_op");
+  }
+  const msgStart = OTS_MAGIC.length + 1 + 1;
+  const otsMsg = otsBytes.slice(msgStart, msgStart + 32);
+  if (!bytesEq(otsMsg, byteRangeDigest)) {
+    throw new Error(".ots commits to a different digest than SHA-256(ByteRange) — document was modified after signing");
+  }
+  const anchoredHashHex = toHex(otsMsg);
+  let timestampBlob = otsBytes.slice(msgStart + 32);
+  let upgradedFromCalendar = null;
+  let btc = findBitcoinAttestation(timestampBlob);
+  if (!btc.found) {
+    const up = await tryUpgradeOtsTimestamp(timestampBlob, otsMsg, { fetchImpl, signal, timeoutMs });
+    if (up.upgraded) {
+      upgradedFromCalendar = up.calendarUrl;
+      timestampBlob = up.timestampBytes;
+      btc = findBitcoinAttestation(timestampBlob);
+    }
+  }
+
+  if (btc.found) {
+    const blockHash = await fetchBlockHashSilently(btc.blockHeight);
+    const upgradeNote = upgradedFromCalendar
+      ? ` Loaded the Bitcoin-upgraded proof from ${upgradedFromCalendar} (the PDF still embeds the calendar-only snapshot from signing time).`
+      : "";
+    if (blockHash) {
+      return {
+        ok: true,
+        state: "ok",
+        blockHash,
+        detail: `OpenTimestamps Bitcoin attestation at block height ${btc.blockHeight}, block hash ${blockHash} (blockstream.info).${upgradeNote} This check confirms marker shape + that the block exists — for full merkle-path proof run \`ots verify <file.ots>\` offline.`,
+      };
+    }
+    if (BLOCKSTREAM_LOOKUP_ENABLED) {
+      return {
+        ok: false,
+        state: "info",
+        blockHash: null,
+        detail: `Bitcoin attestation marker at block height ${btc.blockHeight}, but blockstream.info returned no hash.${upgradeNote} Use \`ots verify\` offline for full validation.`,
+      };
+    }
+    return {
+      ok: false,
+      state: "info",
+      blockHash: null,
+      detail: `Bitcoin attestation marker at block height ${btc.blockHeight}.${upgradeNote} Block-hash lookup is OFF — run \`ots verify\` offline for cryptographic proof.`,
+    };
+  }
+
+  const ageMs = signingTimeMs != null ? Date.now() - signingTimeMs : null;
+  const stale = ageMs != null && ageMs > OTS_STALE_AFTER_SIGNING_MS;
+  if (stale) {
+    return {
+      ok: false,
+      state: "info",
+      blockHash: null,
+      detail: `Embedded OpenTimestamps proof is calendar-only (${otsBytes.length} bytes) and public calendars did not return a Bitcoin attestation for this commitment when queried just now. Signing was ${Math.round(ageMs / 3_600_000)}h ago — if you expected on-chain confirmation, download a fresh \`.ots\` from the receipt's proof URL (server cron upgrades stored proofs) or run \`ots upgrade\` on the embedded bytes. This does NOT reduce CMS signature validity.`,
+    };
+  }
+  return {
+    ok: false,
+    state: "waiting",
+    blockHash: null,
+    detail: `OpenTimestamps proof embedded (${otsBytes.length} bytes) and matches SHA-256(ByteRange). Public calendars were queried; Bitcoin confirmation is still pending (typically within about an hour of signing). This expected right after signing does NOT reduce signature validity.`,
+  };
+}
+
 function readVarUint(buf, offset) {
   let result = 0;
   let shift = 0;
@@ -2121,6 +2205,11 @@ export {
   extractSignatures, verifySignature, parseCms, parseCertificate,
   OID, DIGEST_INFO, SIGALG_INFO, CURVE_INFO,
   setBlockstreamLookupEnabled,
+  findBitcoinAttestation,
+  tryUpgradeOtsTimestamp,
+  evaluateEmbeddedOtsProof,
+  DEFAULT_OTS_CALENDARS,
+  BTC_ATTESTATION_TAG,
   // Lower-level helpers — exported for test/verifier.test.mjs to exercise
   // edge-case paths (BER indefinite-length parsing, loose-DigestInfo RSA
   // verify) without re-implementing them in the test. The bigint helpers are
@@ -2166,6 +2255,37 @@ function setStatus(msg, kind = "info") {
   els.status.classList.toggle("is-ok", kind === "ok");
 }
 
+function setPanelStatus(value, pill, done = false) {
+  const valueEl = document.getElementById("verify-panel-status-value");
+  const pillEl = document.getElementById("verify-panel-status-pill");
+  if (valueEl) valueEl.textContent = value;
+  if (pillEl) {
+    pillEl.textContent = pill;
+    pillEl.classList.toggle("is-done", done);
+  }
+}
+
+function setPanelStatusInitial() {
+  const valueEl = document.getElementById("verify-panel-status-value");
+  const pillEl = document.getElementById("verify-panel-status-pill");
+  if (valueEl) {
+    valueEl.replaceChildren(
+      Object.assign(document.createElement("span"), {
+        className: "panel-status-value-long",
+        textContent: "Drop a PDF to run five checks locally",
+      }),
+      Object.assign(document.createElement("span"), {
+        className: "panel-status-value-short",
+        textContent: "Drop PDF to check locally",
+      }),
+    );
+  }
+  if (pillEl) {
+    pillEl.textContent = "WAITING";
+    pillEl.classList.remove("is-done");
+  }
+}
+
 function makeResultBlock(sigIndex, sigCount) {
   const frag = els.template.content.cloneNode(true);
   const block = frag.querySelector(".verify-result-block");
@@ -2195,6 +2315,9 @@ function renderCheck(checkEl, state, summary, detail) {
   } else if (state === "info") {
     checkEl.classList.add("is-grey");
     icon.textContent = "○"; // hollow circle — "not applicable / not used by this signature"
+  } else if (state === "waiting") {
+    checkEl.classList.add("is-grey");
+    icon.textContent = "⏳"; // hourglass — anchor in progress, Bitcoin confirmation pending (~1h)
   } else {
     checkEl.classList.add("is-grey");
     icon.textContent = "…"; // ellipsis (pending)
@@ -2238,9 +2361,10 @@ function renderResultIntoBlock(block, result) {
     warn: "RFC 3161 timestamp present with caveats — see details.",
   };
   const otsSummary = {
-    ok:   `OpenTimestamps Bitcoin attestation marker present; block hash ${result.checks.ots.blockHash || "(resolved)"} (lookup-shape only — for full proof use \`ots verify\`).`,
+    ok: `OpenTimestamps Bitcoin attestation confirmed (block ${result.checks.ots.blockHash || "resolved"}). The verifier queries public calendars when the PDF still embeds a calendar-only snapshot.`,
     fail: "OpenTimestamps proof is present but broken — see details.",
-    info: "OpenTimestamps anchor not cryptographically green here (absent, calendar-only, marker-without-block-hash, or shape-only check). Doesn't reduce signature validity. Details below explain which case.",
+    waiting: "OpenTimestamps proof matches the document; public calendars were queried and Bitcoin confirmation is still pending (usually within about an hour of signing). Doesn't reduce signature validity.",
+    info: "OpenTimestamps anchor not evaluated as cryptographically green here (absent, marker-without-block-hash, or shape-only check). Doesn't reduce signature validity. Details below explain which case.",
     warn: "OpenTimestamps anchor with caveats — see details.",
   };
   const evidenceSummary = {
@@ -2260,13 +2384,16 @@ function renderResultIntoBlock(block, result) {
 async function handleFile(file) {
   if (!file || typeof file !== "object" || typeof file.arrayBuffer !== "function") {
     setStatus("Drop one PDF file (folder/text-drag not supported).", "error");
+    setPanelStatusInitial();
     return;
   }
   if (file.size > MAX_PDF_BYTES) {
     setStatus(`That PDF is ${formatBytes(file.size)} — over the ${formatBytes(MAX_PDF_BYTES)} cap. Refusing to load it in-memory.`, "error");
+    setPanelStatus("File too large to verify in-browser", "ERROR");
     return;
   }
   setStatus(`Verifying ${file.name} (${formatBytes(file.size)}) — fully in this browser, no upload.`);
+  setPanelStatus("Running CMS · X.509 · RFC 3161 · OpenTimestamps · evidence checks…", "CHECKING");
   // Clear previous results.
   while (els.results.firstChild) els.results.removeChild(els.results.firstChild);
   try {
@@ -2336,13 +2463,17 @@ async function handleFile(file) {
 
     if (priorBroken) {
       setStatus(`Verification complete — signature ${priorBroken.index} of ${priorBroken.total} (earlier revision) did NOT verify: ${priorBroken.detail}.`, "error");
+      setPanelStatus("Earlier revision failed — expand tiles for detail", "FAIL");
     } else if (anyFail) {
       setStatus("Verification complete — one or more checks did not pass. Expand each tile for details.", "error");
+      setPanelStatus("One or more checks did not pass", "REVIEW");
     } else if (allCoreOk) {
       const expiredNote = priorExpired ? ` Note: signature ${priorExpired.index} of ${priorExpired.total}'s cert expired post-signing (legitimate aging, not tampering).` : "";
       setStatus(`Verification complete — ${sigs.length === 1 ? "signature is valid" : `all ${sigs.length} signatures verify`}.${expiredNote}`, "ok");
+      setPanelStatus("CMS · X.509 · RFC 3161 · OpenTimestamps · evidence — core checks passed", "PASS", true);
     } else {
       setStatus("Verification complete — see per-signature details.", "info");
+      setPanelStatus("Verification finished — see per-signature details", "REVIEW");
     }
     // Hand off any envelope ids to verify-audit.js (loaded only on /verify) so
     // it can fetch + re-verify the server-side audit chain. The event is inert
@@ -2352,6 +2483,7 @@ async function handleFile(file) {
     }));
   } catch (e) {
     setStatus("Could not verify: " + e.message, "error");
+    setPanelStatus("Could not verify this file", "ERROR");
   }
 }
 
@@ -2438,4 +2570,3 @@ els.file.addEventListener("change", (e) => {
   if (file) handleFile(file);
 });
 }  // bindUi
-
