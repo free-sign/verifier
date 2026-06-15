@@ -94,6 +94,17 @@ still show "not trusted" until you add the FreeSign CA to your trust store.
 
 ---
 
+## For AI agents
+
+An [Agent Skill](./free-sign-agent/SKILL.md) ships in this repo
+(`free-sign-agent/SKILL.md`). It teaches an AI agent how to **verify** a
+FreeSign PDF offline with the library above, and how to **sign** one by driving
+the hosted ceremony at free-sign.com without ever uploading the PDF. Drop it
+into a Claude / agent skills directory, or just read it as a concise operator's
+guide to both flows.
+
+---
+
 ## What it verifies
 
 For **each signature** in the PDF:
