@@ -282,13 +282,22 @@ async function verifyEmbeddedWebauthnAssertion(ev, {
   if (clientData.challenge !== bytesToB64u(payloadHash)) {
     return { ok: false, detail: "passkey assertion challenge does not match the signed payload hash" };
   }
-  // Identity binding — the assertion must name the credential the
-  // primary-signed canonical_payload committed to. canonical_payload.webauthn
-  // is covered by signature_base64url; the webauthn_assertion block is not, so
-  // without this check a forged assertion could be substituted wholesale.
+  // The assertion must name a credential.
+  if (!wa.credential_id) {
+    return { ok: false, detail: "passkey assertion record is missing credential_id" };
+  }
+  // Identity binding. When the signed canonical_payload commits a credential id
+  // (legacy in-payload flow), the assertion must name THAT exact credential, so a
+  // forged assertion can't be substituted wholesale. Discoverable (resident)
+  // passkeys cannot commit the id inside the challenge-bound payload — the browser
+  // only learns which credential the authenticator picked AFTER get() — so it
+  // rides on the assertion instead (canonical_payload.webauthn is just the marker
+  // {}). There the binding is the challenge check above (the assertion is signed
+  // over THIS payload's hash) plus the assertion-signature check; the credential
+  // id is reported, not cross-checked against the payload.
   const committedCredId = ev.canonical_payload && ev.canonical_payload.webauthn
     && ev.canonical_payload.webauthn.credential_id;
-  if (!committedCredId || wa.credential_id !== committedCredId) {
+  if (committedCredId && wa.credential_id !== committedCredId) {
     return { ok: false, detail: "passkey assertion credential_id does not match the signed payload's webauthn.credential_id" };
   }
   return {
