@@ -65,7 +65,7 @@ const OID = {
   subjectKeyIdentifier: "2.5.29.14",
   // FreeSign-specific OpenTimestamps unsignedAttribute.
   freeSignOtsCommitment: "1.3.6.1.4.1.65834.1.1",
-  // FreeSign-specific signing-evidence record unsignedAttribute. OCTET STRING
+  // FreeSign-specific signing-evidence record signedAttribute. OCTET STRING
   // { utf8(evidence JSON) } — the pre-seal ceremony record.
   freeSignEvidence: "1.3.6.1.4.1.65834.1.2",
 };
@@ -548,15 +548,17 @@ function parseCertificate(certDer) {
   };
 }
 
-// The freesign_verified_seal variant (/platform-seal route) signs every
-// document with ONE shared platform certificate — an organisational e-seal,
-// CN "(Free)Sign Platform Seal", O "free-sign.com", and crucially with NO
-// rfc822Name SAN (every per-user signer leaf carries a verified-email SAN; the
-// org seal never does). Detection keys on that stable subject identity, NOT on
-// issuer == subject — so it stays correct whether the seal cert is self-signed
-// (legacy bootstrap) or issued under the FreeSign signing CA.
+// The legacy freesign_verified_seal variant (/platform-seal route) used ONE
+// shared, self-signed platform certificate — an organisational e-seal, CN
+// "(Free)Sign Platform Seal", O "free-sign.com", and no rfc822Name SAN. Those
+// subject/SAN fields are attacker-controlled in an arbitrary embedded CMS, so
+// they are only safe as a compatibility hint for the legacy self-signed seal.
+// Never use subject text alone to grant FreeSign platform-seal trust or to skip
+// evidence-record signer-name binding for CA-issued leaves: a malicious CMS can
+// embed its own CA and issue a spoofed "FreeSign Platform Seal" certificate.
 function looksLikePlatformSeal(leaf) {
   if (!leaf) return false;
+  if (!bytesEq(leaf.issuerDer, leaf.subjectDer)) return false;
   const cn = String(leaf.subjectCn || "");
   const subject = String(leaf.subjectString || "").toLowerCase();
   return /platform seal/i.test(cn)
@@ -1282,9 +1284,10 @@ function extractSignatures(pdfBytes) {
     throw new Error(`PDF too large (${pdfBytes.length} bytes; cap ${MAX_PDF_BYTES})`);
   }
   // Treat PDF as latin-1 text to scan for /ByteRange — PDF syntax is ASCII so
-  // binary content streams won't match by chance. We accept ByteRange[0]==0
-  // (the universal PAdES convention) AND non-zero starts (theoretically
-  // legal — issue #17). For each /ByteRange we look for the nearest /Contents
+  // binary content streams won't match by chance. A signature must cover the
+  // PDF from offset 0 through the signed revision, except for the /Contents
+  // gap; otherwise leading bytes can affect viewer rendering while remaining
+  // outside the CMS messageDigest. For each /ByteRange we look for the nearest /Contents
   // in BOTH directions (issue #14) within the same enclosing dict, so signers
   // who emit /Contents BEFORE /ByteRange (allowed — PDF dicts are unordered)
   // verify cleanly.
@@ -1298,14 +1301,19 @@ function extractSignatures(pdfBytes) {
     const off2 = parseInt(m[3], 10);
     const len2 = parseInt(m[4], 10);
     if (a0 < 0 || len1 < 0 || off2 < a0 + len1 || len2 < 0) continue;
-    if (len1 + len2 > MAX_SIGNED_REGION_BYTES) {
-      throw new Error(`ByteRange spans ${len1 + len2} bytes; cap ${MAX_SIGNED_REGION_BYTES}`);
-    }
+    // Skip an out-of-cap /ByteRange like any other invalid match (continue, not
+    // throw): attacker-controlled PDF text can carry a fake oversized /ByteRange
+    // literal anywhere — throwing here would abort extraction of the real later
+    // signature and, on the signing hot path (selfVerifySealedPdf), grief the
+    // whole ceremony. A real signature is still gated by the /Contents check below.
+    if (len1 + len2 > MAX_SIGNED_REGION_BYTES) continue;
     if (a0 + len1 > pdfBytes.length || off2 + len2 > pdfBytes.length) continue;
+    const signedEnd = off2 + len2;
     // Locate the nearest /Contents <hex> within ±MAX_SIG_DICT_SCAN of this
     // /ByteRange. Tries forward first (most common), then backward.
     const span = findContentsSpan(text, m.index, MAX_SIG_DICT_SCAN);
     if (!span) continue;
+    if (span.ltIdx !== a0 + len1 || span.gtIdx + 1 !== off2) continue;
     let cmsDer;
     try {
       cmsDer = trimTrailingZeros(hexToBytes(text.slice(span.hexStart, span.hexEnd)));
@@ -1318,6 +1326,9 @@ function extractSignatures(pdfBytes) {
     signed.set(pdfBytes.slice(off2, off2 + len2), len1);
     found.push({
       byteRange: { a: a0, len1, off2, len2 },
+      pdfLength: pdfBytes.length,
+      byteRangeEnd: signedEnd,
+      hasUnsignedAppend: false,
       cmsDer,
       signedRegion: signed,
       bracketStart: span.ltIdx,
@@ -1325,7 +1336,45 @@ function extractSignatures(pdfBytes) {
       sigDictText: extractSigDictText(text, m.index),
     });
   }
+  for (const sig of found) {
+    const hasLaterSignedRevision = found.some((other) => other.byteRangeEnd > sig.byteRangeEnd);
+    // Trailing bytes after the last signed revision are an unsigned append —
+    // UNLESS they are a benign PAdES-B-LT /DSS (LTV) incremental update. FreeSign's
+    // own signing flow appends a /DSS revision (leaf+CA certs, CRLs, re-emitted
+    // Catalog) AFTER the signature, because the leaf cert is minted during /seal
+    // once the ByteRange is already frozen. That is legitimate and must not be
+    // reported as a tampering append (it would otherwise abort selfVerifySealedPdf
+    // and break the ceremony). isBenignDssAppend() recognises a DSS/LTV-only tail
+    // and still rejects any tail that adds content or a new (unsigned) signature.
+    const trailingAppend = sig.byteRangeEnd !== pdfBytes.length && !hasLaterSignedRevision;
+    sig.hasUnsignedAppend = trailingAppend
+      && !isBenignDssAppend(text, sig.byteRangeEnd);
+  }
   return found;
+}
+
+// True iff the bytes after `fromOffset` are ONLY a PAdES-B-LT /DSS (LTV)
+// incremental update — a /DSS dictionary plus cert/CRL streams and a re-emitted
+// Catalog, with no new signature and no new document content. Used so the
+// verifier (and the in-ceremony self-check) accept FreeSign's own DSS revision
+// while still rejecting any other unsigned append. Conservative: the tail MUST
+// declare a /DSS dict and MUST NOT introduce a new signature (/ByteRange,
+// /Type /Sig) or new renderable content (/Type /Page, /Type /XObject, /Annots).
+function isBenignDssAppend(text, fromOffset) {
+  const tail = text.slice(fromOffset);
+  // Must actually carry DSS/LTV material — otherwise it is not an LTV revision.
+  if (!/\/DSS\b/.test(tail) && !/\/Type\s*\/DSS\b/.test(tail)) return false;
+  // A new signature in the tail is never benign here: a real later signature is
+  // already represented by hasLaterSignedRevision, so any /ByteRange or /Type /Sig
+  // appearing after the signed region without its own covering revision is an
+  // unsigned-append attempt to smuggle a signature.
+  if (/\/ByteRange\b/.test(tail)) return false;
+  if (/\/Type\s*\/Sig\b/.test(tail)) return false;
+  // No new renderable content / structure may be introduced after the signature.
+  if (/\/Type\s*\/Page\b/.test(tail)) return false;
+  if (/\/Type\s*\/XObject\b/.test(tail)) return false;
+  if (/\/Annots\b/.test(tail)) return false;
+  return true;
 }
 
 // Find the /Contents <hex> span nearest to byteRangeIdx — search forward
@@ -1571,6 +1620,12 @@ async function verifySignature(sig) {
   let verifyParams = null;
   let spkiInfo = null;
   try {
+    if (sig.byteRange?.a !== 0) {
+      throw new Error("ByteRange starts after offset 0 — unsigned leading PDF bytes could affect the displayed document");
+    }
+    if (sig.hasUnsignedAppend) {
+      throw new Error(`ByteRange ends at byte ${sig.byteRangeEnd}, but the current PDF is ${sig.pdfLength} bytes; unsigned bytes were appended after the signed revision`);
+    }
     if (!si.signedAttrsAsHashed) throw new Error("SignedAttributes missing");
     if (!si.digestAlgOid) throw new Error("SignerInfo.digestAlgorithm missing");
     verifyParams = pickVerifyParams({
@@ -1732,6 +1787,13 @@ async function verifySignature(sig) {
       // otherwise satisfy the signature check above.
       if (!ca.basicConstraintsCa) throw new Error("embedded CA cert is missing basicConstraints.cA=TRUE");
       if (!ca.keyUsageKeyCertSign) throw new Error("embedded CA cert is missing keyUsage.keyCertSign");
+      const expectedFreeSignCaSha256 = await fetchExpectedFreeSignCaSha256();
+      if (expectedFreeSignCaSha256) {
+        const caSha256 = toHex(await sha256(ca.der));
+        if (caSha256 !== expectedFreeSignCaSha256) {
+          throw new Error("embedded CA cert does not match this deployment's pinned FreeSign CA fingerprint");
+        }
+      }
       // PAdES: when a TST is present, the AUTHORITATIVE signing time is
       // tstSignedAt (genTime). Fall back to signer-claimed only when no TST.
       const trustTime = tstSignedAt || signerClaimedAt;
@@ -1742,16 +1804,34 @@ async function verifySignature(sig) {
       chainState = "ok";
       chainOk = true;
       const timeSource = tstSignedAt ? `TST genTime ${tstSignedAt.toISOString()} (authoritative)` : (signerClaimedAt ? `signer-claimed ${signerClaimedAt.toISOString()} (no TST, unattested)` : "no signing time available");
-      // A CA-issued platform e-seal still must not be read as a personal
-      // identity claim — flag it so the OK tile is not mistaken for one.
-      const sealPrefix = looksLikePlatformSeal(leaf)
-        ? "FreeSign platform e-seal — an organisational seal, not a personal signature (it attests the document passed through FreeSign; it does not vouch for an individual's identity). "
-        : "";
-      chainDetail = `${sealPrefix}Leaf signature verifies against embedded CA pubkey (${sigCheck.detail}). DN match on Issuer/Subject. Leaf validity: ${leaf.notBefore.toISOString()} → ${leaf.notAfter.toISOString()}. Checked against: ${timeSource}.`;
+      chainDetail = `Leaf signature verifies against embedded CA pubkey (${sigCheck.detail}). DN match on Issuer/Subject. Leaf validity: ${leaf.notBefore.toISOString()} → ${leaf.notAfter.toISOString()}. Checked against: ${timeSource}.`;
     }
   } catch (e) {
     chainDetail = "FAILED: " + e.message;
   }
+
+async function fetchExpectedFreeSignCaSha256() {
+  // Browser /verify runs on the same origin that serves the deployment's
+  // FreeSign CA fingerprint. Node-based unit tests import this module without
+  // a browser location; keep those deterministic and skip the live pin there.
+  if (typeof window === "undefined" || typeof fetch !== "function") return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch("/.well-known/free-sign-signing-ca.sha256.txt", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const fp = (await res.text()).trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(fp)) throw new Error("malformed fingerprint response");
+    return fp;
+  } catch (e) {
+    throw new Error("could not load pinned FreeSign CA fingerprint: " + e.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
   // ---- Check 3: RFC 3161 timestamp (PAdES-B-T).
   // A TST is itself a CMS SignedData with eContentType id-ct-TSTInfo. To say
@@ -1836,23 +1916,26 @@ async function verifySignature(sig) {
     otsDetail = "FAILED: " + e.message;
   }
 
-  // ---- FreeSign signing-evidence record (unsignedAttribute 1.3.6.1.4.1.65834.1.2).
-  // The pre-seal ceremony JSON the browser produced, embedded by /seal into
-  // THIS signer's CMS — so every signer of a multi-party document carries
-  // their own, signer #2 included. We don't just display it: we re-verify the
-  // primary ECDSA P-256 signature it contains (canonical_payload signed by the
-  // browser key) against the embedded public_key_jwk — so a tampered evidence
-  // record FAILS here instead of being shown as fact. The attribute is NOT
-  // covered by the outer CMS signature, which is exactly why this independent
-  // re-verification matters.
+  // ---- FreeSign signing-evidence record (signedAttribute 1.3.6.1.4.1.65834.1.2).
+  // The pre-seal ceremony JSON the browser produced is embedded by /seal into
+  // THIS signer's CMS signedAttrs. Because signedAttrs are covered by the
+  // outer CMS signature, changing the evidence in the PDF /Contents gap now
+  // invalidates Check 2 instead of producing a forged-but-verified record. We
+  // still re-verify the browser ECDSA signature inside the evidence as a
+  // second, independent check of the ceremony payload.
   let evidenceState = "info";
   let evidenceDetail = "";
   let evidenceData = null;
   try {
-    const evAttr = findAttr(si.unsignedAttrs, OID.freeSignEvidence);
+    const signedEvAttr = findAttr(si.signedAttrs, OID.freeSignEvidence);
+    const unsignedEvAttr = findAttr(si.unsignedAttrs, OID.freeSignEvidence);
+    const evAttr = signedEvAttr || unsignedEvAttr;
     if (!evAttr) {
       evidenceState = "info";
-      evidenceDetail = "No FreeSign evidence record (unsignedAttribute 1.3.6.1.4.1.65834.1.2). Pre-embedding PDFs and non-FreeSign signatures don't carry one — it does not reduce signature validity.";
+      evidenceDetail = "No FreeSign evidence record (signedAttribute 1.3.6.1.4.1.65834.1.2). Pre-embedding PDFs and non-FreeSign signatures don't carry one — it does not reduce signature validity.";
+    } else if (!signedEvAttr) {
+      evidenceState = "fail";
+      evidenceDetail = "FreeSign evidence record is present only as a CMS unsignedAttribute. That location is not covered by the CMS signature and may be modified without invalidating the PDF signature, so this embedded evidence is not trusted. Re-seal the document with a version that embeds evidence as a signedAttribute.";
     } else {
       if (evAttr.valueTlv.tag !== 0x04) throw new Error("evidence attribute value is not OCTET STRING");
       const ev = JSON.parse(new TextDecoder().decode(evAttr.valueBytes));
@@ -1883,13 +1966,13 @@ async function verifySignature(sig) {
           // self-signature does not prove it belongs here. A name mismatch is
           // a transplant: fail it instead of showing it as this signer's.
           //
-          // EXCEPTION: the freesign_verified_seal variant (/platform-seal
-          // route) signs every document with ONE shared platform certificate
-          // ("(Free)Sign Platform Seal") — its CN is deliberately not a
-          // person, so a name mismatch there is expected, not a transplant.
-          // Detected by looksLikePlatformSeal() on the seal's stable subject
-          // identity, so it stays correct whether the seal cert is self-signed
-          // (legacy) or issued under the FreeSign signing CA.
+          // EXCEPTION: the legacy self-signed freesign_verified_seal variant
+          // (/platform-seal route) signs every document with ONE shared platform
+          // certificate ("(Free)Sign Platform Seal") — its CN is deliberately
+          // not a person, so a name mismatch there is expected. CA-issued
+          // certificates must not get this exception from spoofable subject
+          // text alone; otherwise transplanted evidence could be accepted for
+          // an attacker-controlled "platform seal" leaf.
           const evName = String(cp.signer_name || "").trim();
           const certName = String(leaf.subjectCn || "").trim();
           const isPlatformSeal = looksLikePlatformSeal(leaf);
@@ -2075,9 +2158,19 @@ async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTime
     throw new Error(".ots commits to a different digest than SHA-256(ByteRange) — document was modified after signing");
   }
   const anchoredHashHex = toHex(otsMsg);
-  let timestampBlob = otsBytes.slice(msgStart + 32);
+  const embeddedBlob = otsBytes.slice(msgStart + 32);
+  let timestampBlob = embeddedBlob;
   let upgradedFromCalendar = null;
+  // The Bitcoin attestation is only authoritative when its marker is present in
+  // the proof that the PDF actually embeds (committed at signing time). A marker
+  // found ONLY after replacing the embedded blob with bytes fetched live from a
+  // public calendar is NOT cryptographically bound here: findBitcoinAttestation
+  // is a marker SCAN, not an OTS-tree validation, so a malicious/compromised
+  // calendar could return arbitrary bytes carrying the BTC tag + a plausible
+  // height. Such an unvalidated calendar upgrade must NOT drive state="ok"
+  // (secu2.md finding) — it stays a non-confirming "waiting".
   let btc = findBitcoinAttestation(timestampBlob);
+  const btcFromEmbedded = btc.found;
   if (!btc.found) {
     const up = await tryUpgradeOtsTimestamp(timestampBlob, otsMsg, { fetchImpl, signal, timeoutMs });
     if (up.upgraded) {
@@ -2087,11 +2180,20 @@ async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTime
     }
   }
 
+  // A marker that only appears in live-fetched calendar bytes is unvalidated:
+  // do not present it as a confirmed Bitcoin attestation.
+  if (btc.found && !btcFromEmbedded) {
+    return {
+      ok: false,
+      state: "waiting",
+      blockHash: null,
+      detail: `A public calendar${upgradedFromCalendar ? ` (${upgradedFromCalendar})` : ""} returned an upgrade carrying a Bitcoin attestation marker (block height ${btc.blockHeight}), but those bytes are fetched live and are NOT cryptographically bound to this document here — this page scans for the marker, it does not validate the full OpenTimestamps merkle path. Treating the proof as still calendar-only / pending. Run \`ots verify <file.ots>\` offline to confirm the Bitcoin anchor cryptographically.`,
+    };
+  }
+
   if (btc.found) {
     const blockHash = await fetchBlockHashSilently(btc.blockHeight);
-    const upgradeNote = upgradedFromCalendar
-      ? ` Loaded the Bitcoin-upgraded proof from ${upgradedFromCalendar} (the PDF still embeds the calendar-only snapshot from signing time).`
-      : "";
+    const upgradeNote = "";
     if (blockHash) {
       return {
         ok: true,
@@ -2220,6 +2322,10 @@ export {
   // Stage 6E — exported so test/verifier.test.mjs can exercise the embedded
   // WebAuthn passkey-assertion re-verification directly.
   cborReadCoseKey, verifyEmbeddedWebauthnAssertion,
+  // Exported so test/verifier.test.mjs can pin the platform-seal identity gate:
+  // the evidence transplant-check exception must be bound to the real FreeSign
+  // Platform Seal cert identity, never to "is self-signed" alone.
+  looksLikePlatformSeal,
 };
 
 // -----------------------------------------------------------------------------
@@ -2253,6 +2359,10 @@ function setStatus(msg, kind = "info") {
   els.status.textContent = msg;
   els.status.classList.toggle("is-error", kind === "error");
   els.status.classList.toggle("is-ok", kind === "ok");
+  // A caveat banner (e.g. self-signed leaf): deliberately NOT green. Falls back
+  // to neutral styling where .is-warn is unstyled — the point is to withhold the
+  // reassuring green "valid" presentation, not to look like an error.
+  els.status.classList.toggle("is-warn", kind === "warn");
 }
 
 function setPanelStatus(value, pill, done = false) {
@@ -2412,6 +2522,7 @@ async function handleFile(file) {
     let priorExpired = null;
     let anyFail = false;
     let allCoreOk = true;
+    let anyCaveat = false; // a non-fatal warn (e.g. self-signed leaf) — green banner is withheld
     // Envelope ids pulled from embedded FreeSign evidence records — handed to
     // verify-audit.js after the loop so it can fetch + re-verify the audit
     // chain. All signers of one document share one envelope, so this collects
@@ -2422,18 +2533,35 @@ async function handleFile(file) {
       try {
         const result = await verifySignature(sigs[i]);
         renderResultIntoBlock(block, result);
-        const evEnvId = result.checks?.evidence?.data?.envelope_id;
-        if (typeof evEnvId === "string" && /^env_[a-f0-9]{32}$/.test(evEnvId) && !auditEnvelopeIds.includes(evEnvId)) {
-          auditEnvelopeIds.push(evEnvId);
+        // Audit handoff: use the SIGNED canonical_payload.envelope_id (covered by
+        // the evidence record's own ECDSA signature we just re-verified), never
+        // the UNSIGNED top-level evidence.envelope_id (an attacker can repoint
+        // that in the CMS unsignedAttribute without breaking any signature).
+        // Only hand off when the evidence check actually passed.
+        if (result.checks?.evidence?.state === "ok") {
+          const evEnvId = result.checks?.evidence?.data?.canonical_payload?.envelope_id;
+          if (typeof evEnvId === "string" && /^env_[a-f0-9]{32}$/.test(evEnvId) && !auditEnvelopeIds.includes(evEnvId)) {
+            auditEnvelopeIds.push(evEnvId);
+          }
         }
         const sigFail = result.checks.cms.state === "fail"
           || result.checks.chain.state === "fail"
           || result.checks.tst.state === "fail"
           || result.checks.ots.state === "fail"
           || result.checks.evidence.state === "fail";
+        // "warn" (e.g. a self-signed leaf whose identity is self-asserted) is NOT
+        // a green outcome — anyone can mint a self-signed cert claiming any name.
+        // Treat warn as a caveat that withholds the green "valid" banner, while
+        // not being an outright failure. Only ok/info count toward all-core-ok.
         const sigCoreOk = result.checks.cms.state === "ok"
-          && (result.checks.chain.state === "ok" || result.checks.chain.state === "info" || result.checks.chain.state === "warn");
+          && (result.checks.chain.state === "ok" || result.checks.chain.state === "info");
+        const sigCaveat = result.checks.cms.state === "warn"
+          || result.checks.chain.state === "warn"
+          || result.checks.tst.state === "warn"
+          || result.checks.ots.state === "warn"
+          || result.checks.evidence.state === "warn";
         if (sigFail) anyFail = true;
+        if (sigCaveat) anyCaveat = true;
         if (!sigCoreOk) allCoreOk = false;
         // Surface earlier-revision tampering vs cert-expiry separately:
         // tampering breaks documents, expiry is normal long-lived aging.
@@ -2467,6 +2595,12 @@ async function handleFile(file) {
     } else if (anyFail) {
       setStatus("Verification complete — one or more checks did not pass. Expand each tile for details.", "error");
       setPanelStatus("One or more checks did not pass", "REVIEW");
+    } else if (anyCaveat) {
+      // Cryptographically intact, but carrying a trust caveat (e.g. a self-signed
+      // leaf). NOT a green banner: the signer identity is self-asserted, so the
+      // recipient must confirm the cert fingerprint out of band before trusting it.
+      setStatus(`Verification complete — ${sigs.length === 1 ? "the signature is cryptographically intact" : `all ${sigs.length} signatures are cryptographically intact`}, but at least one carries a trust caveat (e.g. a self-signed certificate whose identity is NOT third-party-attested). Expand the certificate-chain tile and confirm the signer identity out of band.`, "warn");
+      setPanelStatus("Cryptographically intact — review identity (self-asserted / not trust-anchored)", "REVIEW");
     } else if (allCoreOk) {
       const expiredNote = priorExpired ? ` Note: signature ${priorExpired.index} of ${priorExpired.total}'s cert expired post-signing (legitimate aging, not tampering).` : "";
       setStatus(`Verification complete — ${sigs.length === 1 ? "signature is valid" : `all ${sigs.length} signatures verify`}.${expiredNote}`, "ok");

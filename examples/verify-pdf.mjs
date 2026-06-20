@@ -39,10 +39,18 @@ console.log(`Signatures found: ${sigs.length}\n`);
 // ok/warn/info/fail). `ok` is true only when state === "ok".
 //
 // Fatal-for-integrity classification mirrors free-sign.com/verify: a check fails
-// integrity ONLY when its state is "fail". "warn" is a real, distinct outcome
-// (e.g. the self-signed freesign_verified_seal platform-seal cert, enabled by
-// default) — a valid signature carrying a trust caveat, NOT a failure.
+// ONLY when its state is "fail". "warn" is a real, distinct outcome (e.g. the
+// self-signed freesign_verified_seal platform-seal cert, enabled by default) —
+// a valid signature carrying a trust caveat, NOT a failure.
+//
+// IMPORTANT: a "fail" in ANY of the five load-bearing checks (cms, chain, tst,
+// ots, evidence) fails the process — exactly as the hosted /verify sets its
+// REVIEW verdict (`sigFail`). The embedded FreeSign evidence and the timestamp
+// material are CMS UNSIGNED attributes, so they are NOT covered by the outer
+// CMS signature and an attacker can tamper with them while leaving cms+chain
+// intact; treating only cms+chain as fatal would silently accept that tamper.
 const FATAL = (state) => state === "fail";
+const FATAL_CHECKS = ["cms", "chain", "tst", "ots", "evidence"];
 const mark = (c) =>
   c.state === "ok" ? "✓ ok"
   : c.state === "warn" ? "⚠ warn"
@@ -50,7 +58,7 @@ const mark = (c) =>
   : c.state === "info" ? "· info"
   : "✗ fail";
 
-let allIntegrityOk = true; // no signature has a FATAL cms/chain state
+let allIntegrityOk = true; // no signature has a FATAL state in any of the 5 checks
 let anyCaveat = false;     // some non-fatal warn surfaced (trust caveat)
 for (let i = 0; i < sigs.length; i += 1) {
   let r;
@@ -77,20 +85,21 @@ for (let i = 0; i < sigs.length; i += 1) {
     if (chk.state !== "ok" && chk.detail) console.log(`    ${name}: ${chk.detail}`);
   }
   console.log("");
-  // cms + chain are the integrity verdict; tst/ots/evidence are corroborating.
-  // Only a FATAL ("fail") state breaks integrity; "warn" is a caveat, not FAIL.
-  if (FATAL(c.cms.state) || FATAL(c.chain.state)) allIntegrityOk = false;
-  if (c.cms.state === "warn" || c.chain.state === "warn") anyCaveat = true;
+  // A "fail" in ANY load-bearing check (cms, chain, tst, ots, evidence) fails
+  // the verdict — matching the hosted verifier's REVIEW condition. "warn" stays
+  // a non-fatal caveat.
+  if (FATAL_CHECKS.some((name) => FATAL(c[name].state))) allIntegrityOk = false;
+  if (FATAL_CHECKS.some((name) => c[name].state === "warn")) anyCaveat = true;
 }
 
 // Note: a clean integrity verdict is independent of Adobe AATL trust-list
 // membership — FreeSign runs its own CA, so Adobe Reader shows yellow by design.
 if (!allIntegrityOk) {
-  console.error("FAIL: at least one signature did not pass CMS + chain (integrity).");
+  console.error("FAIL: at least one signature has a failed load-bearing check (CMS, certificate chain, RFC 3161 timestamp, OpenTimestamps, or embedded evidence).");
   process.exit(1);
 }
 if (anyCaveat) {
-  console.log("PASS (with trust caveat): every signature is cryptographically intact (CMS + certificate chain), but at least one carries a ⚠ warn — e.g. a self-signed / platform-seal cert that is not anchored to a public trust root. Confirm the cert fingerprint out of band.");
+  console.log("PASS (with trust caveat): every load-bearing check (CMS, certificate chain, timestamp, OpenTimestamps, evidence) is intact, but at least one carries a ⚠ warn — e.g. a self-signed / platform-seal cert that is not anchored to a public trust root. Confirm the cert fingerprint out of band.");
 } else {
-  console.log("PASS: every signature is cryptographically intact (CMS + certificate chain).");
+  console.log("PASS: every signature passes all load-bearing checks (CMS, certificate chain, timestamp, OpenTimestamps, evidence).");
 }
