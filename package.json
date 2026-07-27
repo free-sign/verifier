@@ -8,6 +8,10 @@
   "engines": {
     "node": ">=18"
   },
+  "//dependencies": "verify.js loads @noble/post-quantum lazily — ONLY when a PDF carries the ML-DSA post-quantum co-signature. Every other check (CMS, chain, RFC 3161, OpenTimestamps, evidence) runs on Node built-ins alone, so `npm install` is optional unless you verify post-quantum-sealed PDFs.",
+  "dependencies": {
+    "@noble/post-quantum": "^0.6.1"
+  },
   "scripts": {
     "example": "node examples/verify-pdf.mjs",
     "example:audit": "node examples/verify-audit-chain.mjs"

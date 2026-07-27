@@ -1,6 +1,7 @@
 // FreeSign PDF Verifier — runs entirely in the browser. Drop a signed PDF, get
-// five evidence checks: CMS signature, certificate chain, RFC 3161 timestamp,
-// OpenTimestamps Bitcoin anchor, and an explanation of Adobe AATL.
+// six evidence checks: CMS signature, certificate chain, RFC 3161 timestamp,
+// OpenTimestamps Bitcoin anchor, the FreeSign evidence record, the ML-DSA
+// post-quantum co-signature — plus an explanation of Adobe AATL.
 //
 // Privacy invariant: the PDF bytes never leave the browser. Network calls are
 // limited to (1) optional GETs to allowlisted OpenTimestamps calendar hosts
@@ -51,6 +52,12 @@ const OID = {
   mgf1: "1.2.840.113549.1.1.8",
   ed25519: "1.3.101.112",
   ed448: "1.3.101.113",
+  // ML-DSA (FIPS 204) — RFC 9881 (X.509) / RFC 9882 (CMS). The same OID
+  // identifies the signature algorithm AND the SubjectPublicKeyInfo algorithm;
+  // parameters are ABSENT and there is no digest dispatch (like Ed25519).
+  mlDsa44: "2.16.840.1.101.3.4.3.17",
+  mlDsa65: "2.16.840.1.101.3.4.3.18",
+  mlDsa87: "2.16.840.1.101.3.4.3.19",
   // SubjectPublicKeyInfo algorithm OIDs.
   ecPublicKey: "1.2.840.10045.2.1",
   // Named curves (parameter inside ecPublicKey AlgorithmIdentifier).
@@ -65,10 +72,84 @@ const OID = {
   subjectKeyIdentifier: "2.5.29.14",
   // FreeSign-specific OpenTimestamps unsignedAttribute.
   freeSignOtsCommitment: "1.3.6.1.4.1.65834.1.1",
+  // OpenTimestamps commitment over SHA-256(SignedAttributes) — the same .ots
+  // payload shape as …1.1, anchoring the attribute set (post-quantum key
+  // commitment + messageDigest + signingCertificateV2) rather than the
+  // document. See src/cms.js for why it is not circular to embed it.
+  freeSignSignedAttrsOtsCommitment: "1.3.6.1.4.1.65834.1.5",
   // FreeSign-specific signing-evidence record signedAttribute. OCTET STRING
   // { utf8(evidence JSON) } — the pre-seal ceremony record.
   freeSignEvidence: "1.3.6.1.4.1.65834.1.2",
+  // FreeSign post-quantum co-signature pair (invariant #14):
+  //   .1.3 signedAttr   SEQUENCE { algorithm OID, publicKeyHash OCTET STRING }
+  //   .1.4 unsignedAttr SEQUENCE { algorithm OID, publicKey OCTET STRING,
+  //                                signature OCTET STRING }
+  freeSignPqCommitment: "1.3.6.1.4.1.65834.1.3",
+  freeSignPqSignature: "1.3.6.1.4.1.65834.1.4",
 };
+
+// ML-DSA parameter sets, keyed by algorithm OID. `keyBytes` / `sigBytes` are
+// the FIPS 204 fixed lengths — checked before the (much more expensive)
+// lattice verification, so a malformed attribute is rejected cheaply.
+const ML_DSA_INFO = {
+  [OID.mlDsa44]: { label: "ML-DSA-44", module: "ml_dsa44", keyBytes: 1312, sigBytes: 2420 },
+  [OID.mlDsa65]: { label: "ML-DSA-65", module: "ml_dsa65", keyBytes: 1952, sigBytes: 3309 },
+  [OID.mlDsa87]: { label: "ML-DSA-87", module: "ml_dsa87", keyBytes: 2592, sigBytes: 4627 },
+};
+
+// @noble/post-quantum, loaded on demand — ML-DSA is not in WebCrypto in any
+// shipping browser (nor in workerd), so the only way to check a post-quantum
+// signature here is a JS implementation. It is imported LAZILY so the
+// classical RSA/ECDSA path stays dependency-free: a PDF without a PQ
+// co-signature never pulls these ~200 KB.
+//
+// Two specifiers, one guard: in the browser the library is same-origin
+// vendored (public/vendor/noble/…, no CDN — invariant #8's supply-chain
+// rationale); under Node (the open-source verifier mirror, the unit tests) it
+// resolves from node_modules. Same file contents modulo import rewriting; see
+// tools/vendor-deps.mjs.
+// "The library isn't here" is a capability gap, not evidence about the
+// document. It must never be reported as a signature failure: under Node the
+// OSS mirror ships without node_modules by design, and in the browser a stale
+// deploy could 404 /vendor/noble/** — in both cases every post-quantum FreeSign
+// PDF would otherwise read as tampered.
+export class MlDsaUnavailable extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "MlDsaUnavailable";
+  }
+}
+
+let mlDsaModulePromise = null;
+function loadMlDsaModule() {
+  if (!mlDsaModulePromise) {
+    const specifier = typeof document === "undefined"
+      ? "@noble/post-quantum/ml-dsa.js"
+      : "/vendor/noble/post-quantum/ml-dsa.js";
+    mlDsaModulePromise = import(/* webpackIgnore: true */ specifier).catch((e) => {
+      // Do NOT memoize the rejection: one transient load failure would
+      // otherwise poison every later signature in the same page session.
+      mlDsaModulePromise = null;
+      throw new MlDsaUnavailable(`could not load the ML-DSA implementation (${specifier}): ${e.message}`);
+    });
+  }
+  return mlDsaModulePromise;
+}
+
+/** Resolve an ML-DSA algorithm OID to {label, verify(sig, msg, pubKey)}. */
+async function getMlDsa(oid) {
+  const info = ML_DSA_INFO[oid];
+  if (!info) throw new Error("unsupported ML-DSA algorithm OID " + oid);
+  const mod = await loadMlDsaModule();
+  const impl = mod[info.module];
+  if (!impl) throw new MlDsaUnavailable(`ML-DSA implementation ${info.module} not available`);
+  return {
+    ...info,
+    // FIPS 204 pure mode, empty context — what RFC 9882 mandates for CMS and
+    // what the Worker's src/pq-signature.js produces.
+    verify: (signature, message, publicKey) => impl.verify(signature, message, publicKey),
+  };
+}
 
 // Mapping from digest OID to WebCrypto hash name + raw byte size.
 // NOTE: SHA-1 is intentionally NOT in this table. It's known to be vulnerable
@@ -96,6 +177,11 @@ const SIGALG_INFO = {
   [OID.rsassaPss]:       { kind: "RSA-PSS", implicitDigestOid: null }, // params carry hash, MGF1, saltLength
   [OID.ed25519]:         { kind: "Ed25519", implicitDigestOid: null },
   [OID.ed448]:           { kind: "Ed448",   implicitDigestOid: null },
+  // ML-DSA is digest-less in the same sense as Ed25519: the algorithm signs
+  // the message itself (FIPS 204 hashes internally with SHAKE).
+  [OID.mlDsa44]:         { kind: "ML-DSA",  implicitDigestOid: null },
+  [OID.mlDsa65]:         { kind: "ML-DSA",  implicitDigestOid: null },
+  [OID.mlDsa87]:         { kind: "ML-DSA",  implicitDigestOid: null },
 };
 
 // EC named-curve OID → WebCrypto name + raw integer byte size (for P1363 r||s).
@@ -600,7 +686,25 @@ function buildVerifyInput(signatureBytes, dataBytes, verifyParams, spkiInfo) {
   if (verifyParams.kind === "Ed25519" || verifyParams.kind === "Ed448") {
     return { alg: { name: verifyParams.kind }, sig: signatureBytes, data: dataBytes };
   }
+  if (verifyParams.kind === "ML-DSA") {
+    return { alg: { name: "ML-DSA" }, sig: signatureBytes, data: dataBytes };
+  }
   throw new Error("buildVerifyInput: unknown kind " + verifyParams.kind);
+}
+
+// crypto.subtle.verify, plus the one algorithm WebCrypto can't do. Every
+// signature check in this file goes through here so ML-DSA support lands in
+// the SignerInfo path, the nested-CMS (TST) path and the certificate-chain
+// path at once, with identical semantics.
+async function verifyDetached(pubKey, verifyInput) {
+  if (pubKey && pubKey.__mlDsaOid) {
+    const impl = await getMlDsa(pubKey.__mlDsaOid);
+    if (verifyInput.sig.length !== impl.sigBytes) {
+      throw new Error(`${impl.label} signature must be ${impl.sigBytes} bytes, got ${verifyInput.sig.length}`);
+    }
+    return impl.verify(verifyInput.sig, verifyInput.data, pubKey.rawPublicKey);
+  }
+  return crypto.subtle.verify(verifyInput.alg, pubKey, verifyInput.sig, verifyInput.data);
 }
 
 function describeAlg(verifyParams, spkiInfo) {
@@ -609,6 +713,9 @@ function describeAlg(verifyParams, spkiInfo) {
   if (verifyParams.kind === "RSA-PSS") return `RSA-PSS + ${verifyParams.hashName} (salt ${verifyParams.saltLength}B)`;
   if (verifyParams.kind === "Ed25519") return "Ed25519";
   if (verifyParams.kind === "Ed448") return "Ed448";
+  if (verifyParams.kind === "ML-DSA") {
+    return (ML_DSA_INFO[verifyParams.mlDsaOid] || {}).label || "ML-DSA";
+  }
   return verifyParams.kind;
 }
 
@@ -628,6 +735,9 @@ function sigAlgFriendlyName(oid) {
     [OID.rsassaPss]:       "RSA-PSS",
     [OID.ed25519]:         "Ed25519",
     [OID.ed448]:           "Ed448",
+    [OID.mlDsa44]:         "ML-DSA-44 (FIPS 204, post-quantum)",
+    [OID.mlDsa65]:         "ML-DSA-65 (FIPS 204, post-quantum)",
+    [OID.mlDsa87]:         "ML-DSA-87 (FIPS 204, post-quantum)",
   };
   return map[oid] || "unknown algorithm";
 }
@@ -669,7 +779,7 @@ async function verifyInnerCmsSignature(innerCms, innerCmsDer) {
   const innerSpkiInfo = parseSpki(signerCert.spkiDer);
   const innerPubKey = await importPublicKey(signerCert.spkiDer, innerSpkiInfo, innerVerifyParams);
   const v = buildVerifyInput(inSi.signatureBytes, inSi.signedAttrsAsHashed, innerVerifyParams, innerSpkiInfo);
-  let sigOk = await crypto.subtle.verify(v.alg, innerPubKey, v.sig, v.data);
+  let sigOk = await verifyDetached(innerPubKey, v);
   if (!sigOk && innerVerifyParams.kind === "RSA") {
     sigOk = await rsaPkcs1V15LooseVerify(signerCert.spkiDer, inSi.signatureBytes, inSi.signedAttrsAsHashed, innerVerifyParams.hashName);
   }
@@ -740,7 +850,7 @@ async function verifyCertSignature(child, parent) {
   }
   const pubKey = await importPublicKey(parent.spkiDer, spkiInfo, verifyParams);
   const v = buildVerifyInput(child.certSigBytes, child.tbsBytes, verifyParams, spkiInfo);
-  let ok = await crypto.subtle.verify(v.alg, pubKey, v.sig, v.data);
+  let ok = await verifyDetached(pubKey, v);
   if (!ok && verifyParams.kind === "RSA") {
     // Same loose-DigestInfo fallback as the SignerInfo path — some legacy
     // CA cert signatures omit the NULL parameter in the DigestInfo too.
@@ -1086,6 +1196,23 @@ export function parseSpki(spkiDer) {
   }
   if (algOid === OID.ed25519) return { kind: "Ed25519" };
   if (algOid === OID.ed448)   return { kind: "Ed448" };
+  if (ML_DSA_INFO[algOid]) {
+    // RFC 9881 §3-4: parameters MUST be absent, and the subjectPublicKey BIT
+    // STRING carries the raw FIPS 204 public key with no wrapping. Rejecting a
+    // stray parameter matters because the parameter set is carried by the OID
+    // alone — anything else in that slot is an encoding we did not agree to.
+    if (algIdKids.length > 1) throw new Error("ML-DSA SPKI AlgorithmIdentifier must have absent parameters (RFC 9881 §3)");
+    const bitStr = kids[1];
+    if (bitStr.tag !== 0x03) throw new Error("ML-DSA SPKI subjectPublicKey is not a BIT STRING");
+    const unusedBits = spkiDer[bitStr.start];
+    if (unusedBits !== 0) throw new Error("ML-DSA SPKI BIT STRING must have 0 unused bits");
+    const rawPublicKey = spkiDer.slice(bitStr.start + 1, bitStr.end);
+    const info = ML_DSA_INFO[algOid];
+    if (rawPublicKey.length !== info.keyBytes) {
+      throw new Error(`${info.label} public key must be ${info.keyBytes} bytes, got ${rawPublicKey.length}`);
+    }
+    return { kind: "ML-DSA", mlDsaOid: algOid, label: info.label, rawPublicKey };
+  }
   throw new Error("unsupported SPKI algorithm OID " + algOid);
 }
 
@@ -1101,6 +1228,14 @@ export function pickVerifyParams({ sigAlgOid, digestOid, sigAlgParams }) {
   // Ed25519 / Ed448 — algorithm is digest-less.
   if (sig.kind === "Ed25519" || sig.kind === "Ed448") {
     return { kind: sig.kind, hashName: null, digestOid: null, digestSize: null };
+  }
+  // ML-DSA — digest-less too; the parameter set is the algorithm OID itself,
+  // and RFC 9882 §3 requires the AlgorithmIdentifier parameters to be absent.
+  if (sig.kind === "ML-DSA") {
+    if (sigAlgParams && sigAlgParams.paramsTlv) {
+      throw new Error("ML-DSA signatureAlgorithm must have absent parameters (RFC 9882 §3)");
+    }
+    return { kind: "ML-DSA", mlDsaOid: sigAlgOid, hashName: null, digestOid: null, digestSize: null };
   }
   // RSA-PSS — read params from the AlgorithmIdentifier.
   if (sig.kind === "RSA-PSS") {
@@ -1138,6 +1273,18 @@ export async function importPublicKey(spkiDer, spkiInfo, verifyParams) {
   if (verifyParams.kind === "Ed25519" || verifyParams.kind === "Ed448") {
     if (spkiInfo.kind !== verifyParams.kind) throw new Error(`${verifyParams.kind} signature but SPKI is ${spkiInfo.kind}`);
     return crypto.subtle.importKey("spki", spkiDer, { name: verifyParams.kind }, false, ["verify"]);
+  }
+  if (verifyParams.kind === "ML-DSA") {
+    // No WebCrypto import path exists — hand back a plain descriptor that
+    // verifyDetached() routes to the vendored @noble implementation. The
+    // signature's parameter set MUST equal the key's: an ML-DSA-44 signature
+    // cannot be validated against an ML-DSA-87 key, and letting the two drift
+    // would mean verifying under an algorithm the certificate never claimed.
+    if (spkiInfo.kind !== "ML-DSA") throw new Error(`ML-DSA signature but SPKI is ${spkiInfo.kind}`);
+    if (spkiInfo.mlDsaOid !== verifyParams.mlDsaOid) {
+      throw new Error(`ML-DSA parameter-set mismatch: signature ${verifyParams.mlDsaOid} vs key ${spkiInfo.mlDsaOid}`);
+    }
+    return { __mlDsaOid: spkiInfo.mlDsaOid, rawPublicKey: spkiInfo.rawPublicKey };
   }
   throw new Error("unknown signature kind " + verifyParams.kind);
 }
@@ -1557,7 +1704,14 @@ function trimTrailingZeros(bytes) {
 // Verification pipeline.
 // -----------------------------------------------------------------------------
 
-async function verifySignature(sig) {
+// `opts.skipOtsCalendarUpgrade` suppresses the live OpenTimestamps calendar
+// lookups both anchor checks would otherwise make. The signing ceremony's own
+// post-seal self-check passes it: that path gates only on `cms` and `chain`,
+// so the upgrade fetches were pure latency on the user's critical path — and
+// two of them, once the SignedAttributes anchor landed. Everything else about
+// the verdict is unchanged; an un-upgraded calendar proof simply stays
+// "waiting" instead of resolving to a block hash.
+async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
   const cms = parseCms(sig.cmsDer);
   const si = cms.signerInfo;
 
@@ -1688,7 +1842,7 @@ async function verifySignature(sig) {
     const pubKey = await importPublicKey(leaf.spkiDer, spkiInfo, verifyParams);
 
     const verifyInput = buildVerifyInput(si.signatureBytes, si.signedAttrsAsHashed, verifyParams, spkiInfo);
-    let ok = await crypto.subtle.verify(verifyInput.alg, pubKey, verifyInput.sig, verifyInput.data);
+    let ok = await verifyDetached(pubKey, verifyInput);
     if (!ok && verifyParams.kind === "RSA") {
       // Fallback for the DigestInfo-without-NULL-parameter encoding (Polish
       // QTSP "Profil Zaufany" seals, some BouncyCastle outputs). Adobe
@@ -1915,7 +2069,7 @@ async function fetchExpectedFreeSignCaSha256() {
       const otsBytes = otsAttr.valueBytes;
       const docDigest = await sha256(sig.signedRegion);
       const signingTimeMs = tstSignedAt ? tstSignedAt.getTime() : (signerClaimedAt ? signerClaimedAt.getTime() : null);
-      const otsEval = await evaluateEmbeddedOtsProof(otsBytes, docDigest, { signingTimeMs });
+      const otsEval = await evaluateEmbeddedOtsProof(otsBytes, docDigest, { signingTimeMs, skipCalendarUpgrade: skipOtsCalendarUpgrade });
       otsState = otsEval.state;
       otsOk = otsEval.ok;
       otsDetail = otsEval.detail;
@@ -1924,6 +2078,91 @@ async function fetchExpectedFreeSignCaSha256() {
   } catch (e) {
     otsDetail = "FAILED: " + e.message;
   }
+  // Same unauthenticated-attribute reasoning as Check 4b below: this attribute
+  // sits in the mutable /Contents gap, so a broken one is only evidence about
+  // the DOCUMENT when the classical signature is broken too. With an intact
+  // signature, a mismatched or malformed anchor means someone appended or
+  // corrupted an attribute that no signature vouches for — which anyone can do
+  // to any signed PDF, FreeSign's or not. Report it, don't fail the document
+  // over it. (When the document really was altered, Check 1 fails and this
+  // stays a failure, so genuine tampering is still surfaced twice.)
+  if (otsState === "fail" && cmsOk) {
+    otsState = "warn";
+    otsOk = false;
+    otsDetail += " The classical signature above is intact, so this anchor — which it does not cover, and which anyone can append — is reported rather than treated as evidence against the document.";
+  }
+
+  // ---- Check 4b: the SignedAttributes OpenTimestamps anchor
+  // (unsignedAttribute 1.3.6.1.4.1.65834.1.5) — same OpenTimestamps machinery,
+  // different commitment, and its MEANING is the post-quantum one.
+  //
+  // The anchor above dates the DOCUMENT. It does not date the *attributes*: an
+  // adversary with a quantum computer could forge a whole new CMS over the same
+  // bytes — new leaf key, new ML-DSA key, new commitment — and the document
+  // anchor would still check out. This one commits to SHA-256(SignedAttributes),
+  // which covers the messageDigest, the signingCertificateV2 binding to the
+  // signer's certificate AND the post-quantum public-key commitment. It is the
+  // hash-based (therefore quantum-resistant) evidence that this exact attribute
+  // set existed before such a machine did.
+  //
+  // Verdict placement: it is folded into `checks.ots` rather than given a
+  // seventh tile — it is an OpenTimestamps anchor, evaluated by exactly the same
+  // code, and a second Bitcoin tile would say "waiting" next to the first one
+  // for the same hour after signing. It can only ever make the OTS verdict
+  // WORSE (a mismatched or malformed proof fails it, like a mismatched document
+  // anchor already does); a healthy one adds a sentence here and one in the
+  // post-quantum check's detail. Absent → informational, never a downgrade:
+  // every PDF sealed before this shipped, and every non-FreeSign signature,
+  // lacks it.
+  let otsSignedAttrsState = "info";
+  let otsSignedAttrsDetail = "";
+  let otsSignedAttrsBlockHash = null;
+  let otsSignedAttrsPresent = false;
+  try {
+    const saAttr = findAttr(si.unsignedAttrs, OID.freeSignSignedAttrsOtsCommitment);
+    if (!saAttr) {
+      otsSignedAttrsDetail = "No SignedAttributes OpenTimestamps anchor (unsignedAttribute 1.3.6.1.4.1.65834.1.5) — the FreeSign-specific proof that the signed attributes (and with them any post-quantum key commitment) existed at a given time. Absent from every non-FreeSign signature and from FreeSign seals made before this anchor shipped; it does not reduce this signature's validity.";
+    } else {
+      otsSignedAttrsPresent = true;
+      if (saAttr.valueTlv.tag !== 0x04) throw new Error("SignedAttributes OTS attribute value is not OCTET STRING");
+      if (!si.signedAttrsAsHashed) throw new Error("SignedAttributes missing — nothing for this anchor to commit to");
+      const signedAttrsDigest = await sha256(si.signedAttrsAsHashed);
+      const signingTimeMsForSa = tstSignedAt ? tstSignedAt.getTime() : (signerClaimedAt ? signerClaimedAt.getTime() : null);
+      const saEval = await evaluateEmbeddedOtsProof(saAttr.valueBytes, signedAttrsDigest, {
+        signingTimeMs: signingTimeMsForSa,
+        commitmentLabel: "SHA-256(SignedAttributes)",
+        skipCalendarUpgrade: skipOtsCalendarUpgrade,
+      });
+      otsSignedAttrsState = saEval.state;
+      otsSignedAttrsBlockHash = saEval.blockHash;
+      otsSignedAttrsDetail = `SignedAttributes anchor: ${saEval.detail}`;
+    }
+  } catch (e) {
+    otsSignedAttrsState = "fail";
+    otsSignedAttrsDetail = "SignedAttributes anchor FAILED: " + e.message;
+  }
+  // A broken anchor only drags the OTS verdict down when the classical
+  // signature ALSO failed — i.e. when the document itself really changed.
+  //
+  // Otherwise the classical signature is intact and this attribute lives in the
+  // mutable /Contents gap, so its mere presence is unauthenticated: anyone can
+  // append a bogus `…65834.1.5` to ANY signed PDF — an Adobe Sign, DocuSign or
+  // QTSP file that never touched FreeSign — without breaking a single
+  // signature. Failing on it would hand an unauthenticated third party the
+  // power to flip a perfectly valid document's verdict to FAIL. Nothing inside
+  // signedAttrs promises that an anchor exists, so there is no authenticated
+  // hook to appeal to; the honest verdict is "present, not usable, ignored".
+  // (Same reasoning as the post-quantum signature attribute below — see the
+  // "Deliberately WARN, not FAIL" note there.)
+  if (otsSignedAttrsState === "fail" && !cmsOk) {
+    otsState = "fail";
+    otsOk = false;
+  } else if (otsSignedAttrsState === "fail") {
+    otsSignedAttrsState = "warn";
+    otsSignedAttrsDetail += " The classical signature above is intact, so this attribute — which is not covered by it and can be appended by anyone — is ignored rather than treated as evidence against the document.";
+    if (otsState === "ok") otsState = "warn";
+  }
+  otsDetail = `${otsDetail} ${otsSignedAttrsDetail}`.trim();
 
   // ---- FreeSign signing-evidence record (signedAttribute 1.3.6.1.4.1.65834.1.2).
   // The pre-seal ceremony JSON the browser produced is embedded by /seal into
@@ -2030,6 +2269,107 @@ async function fetchExpectedFreeSignCaSha256() {
     evidenceDetail = "FAILED: " + e.message;
   }
 
+  // ---- Check 6: post-quantum co-signature (FreeSign-specific, invariant #14).
+  // A pair of attributes: a SIGNED commitment to an ML-DSA public key
+  // (…65834.1.3) and the ML-DSA signature itself over the same SignedAttributes
+  // the classical signature covers (…65834.1.4, unsigned — a signature cannot
+  // be inside the bytes it signs).
+  //
+  // What the pair is worth: today the classical ECDSA/RSA signature binds the
+  // ML-DSA key to this signer, and a TST + the OpenTimestamps anchor date that
+  // binding. If ECDSA/RSA later falls to a quantum computer, the ML-DSA
+  // signature still ties this exact document to a key that was provably
+  // committed to before that happened. It adds nothing to today's validity —
+  // absent → INFO, never a downgrade.
+  //
+  // Both halves must agree: an ML-DSA signature with no signed commitment is
+  // unbound (anyone could mint one), and a commitment with no signature means
+  // the PQ half was stripped out of the mutable /Contents gap after signing.
+  // Both are FAIL — this attribute pair is FreeSign's own, so a broken pair is
+  // never "some other vendor's PDF".
+  let pqState = "info";
+  let pqOk = false;
+  let pqDetail = "";
+  try {
+    const commitAttr = findAttr(si.signedAttrs, OID.freeSignPqCommitment);
+    const pqSigAttr = findAttr(si.unsignedAttrs, OID.freeSignPqSignature);
+    if (!commitAttr && !pqSigAttr) {
+      pqDetail = "No post-quantum co-signature (signedAttribute 1.3.6.1.4.1.65834.1.3 + unsignedAttribute 1.3.6.1.4.1.65834.1.4). This is a FreeSign-specific addition — no other signing vendor emits one today, and no PDF viewer requires it. Its absence says nothing about this signature's validity.";
+    } else if (commitAttr && !pqSigAttr) {
+      pqState = "fail";
+      pqDetail = "The signed attributes commit to an ML-DSA public key, but the matching post-quantum signature (unsignedAttribute 1.3.6.1.4.1.65834.1.4) is MISSING. That attribute lives in the mutable /Contents gap, so it can be removed without breaking the classical signature — this document was stripped of its post-quantum half after signing.";
+    } else if (!commitAttr && pqSigAttr) {
+      // Deliberately WARN, not FAIL. Attribute *presence* in the unsigned set is
+      // unauthenticated: anyone can append this attribute to any CMS — including
+      // a third-party Adobe/QTSP signature that never touched FreeSign — without
+      // breaking a single signature. Failing here would hand an unauthenticated
+      // attacker the ability to flip a perfectly valid document's overall verdict
+      // to FAIL. An unbound key is worth nothing, so we say so and ignore it.
+      // (The mirror case — a signed commitment whose signature attribute is gone
+      // — stays FAIL: that one IS authenticated, the signer vouched for a PQ key
+      // that is no longer there.)
+      pqState = "warn";
+      pqDetail = "A post-quantum signature attribute is present but the SIGNED attributes carry no commitment to its public key. Nothing binds that key to this signer — anyone can append such an attribute to any PDF without breaking its signature — so it carries no evidential weight and is ignored here. It does not reduce the validity of the signature above.";
+    } else {
+      const commit = parsePqCommitment(commitAttr);
+      const pqSig = parsePqSignature(pqSigAttr);
+      if (commit.algOid !== pqSig.algOid) {
+        throw new Error(`algorithm mismatch: commitment says ${commit.algOid}, signature attribute says ${pqSig.algOid}`);
+      }
+      const impl = await getMlDsa(pqSig.algOid);
+      if (pqSig.publicKey.length !== impl.keyBytes) {
+        throw new Error(`${impl.label} public key must be ${impl.keyBytes} bytes, got ${pqSig.publicKey.length}`);
+      }
+      if (pqSig.signature.length !== impl.sigBytes) {
+        throw new Error(`${impl.label} signature must be ${impl.sigBytes} bytes, got ${pqSig.signature.length}`);
+      }
+      const actualHash = await sha256(pqSig.publicKey);
+      if (!bytesEq(actualHash, commit.publicKeyHash)) {
+        throw new Error("the embedded ML-DSA public key does not match the SHA-256 committed to in the signed attributes — the post-quantum key was swapped after signing");
+      }
+      if (!si.signedAttrsAsHashed) throw new Error("SignedAttributes missing — nothing for the ML-DSA signature to cover");
+      const pqVerified = impl.verify(pqSig.signature, si.signedAttrsAsHashed, pqSig.publicKey);
+      if (!pqVerified) throw new Error(`${impl.label} signature did not verify over the SignedAttributes`);
+      // Green only when the classical signature verified as well. The commitment
+      // that binds this ML-DSA key to the signer IS the classical signature — if
+      // that failed, a self-consistent PQ pair proves only that whoever minted
+      // the key signed these attributes, which anyone can do. Caveat, not green.
+      pqOk = cmsOk;
+      pqState = cmsOk ? "ok" : "warn";
+      const classicalNote = cmsOk
+        ? "The classical signature above verifies too, so the key binding holds under today's assumptions"
+        : "NOTE: the classical signature above did NOT verify — and that signature is the only thing binding this ML-DSA key to the signer, so on its own this proves only that whoever minted the key signed these attributes";
+      // The binding above is only as good as the proof that it was made BEFORE
+      // a quantum attacker existed — that proof is the SignedAttributes
+      // OpenTimestamps anchor evaluated in the OpenTimestamps check.
+      // Only an anchor that reached a Bitcoin block header is quantum-resistant
+      // EVIDENCE. A calendar-only anchor ("waiting", the normal state for the
+      // first hour or two after signing) is a calendar operator's unconfirmed
+      // promise — saying "hash-based, therefore quantum-resistant" about it
+      // would be the kind of overclaim this whole page exists to avoid.
+      let anchorNote;
+      if (!otsSignedAttrsPresent) {
+        anchorNote = " These SignedAttributes are not separately OpenTimestamps-anchored (no unsignedAttribute 1.3.6.1.4.1.65834.1.5), so the evidence for WHEN this commitment was made rests on the document anchor and the RFC 3161 timestamp alone.";
+      } else if (otsSignedAttrsState === "ok") {
+        anchorNote = " These SignedAttributes are themselves anchored into the Bitcoin blockchain (unsignedAttribute 1.3.6.1.4.1.65834.1.5), so the moment this key commitment was made has hash-based — therefore quantum-resistant — evidence behind it, not just the classical signature.";
+      } else if (otsSignedAttrsState === "fail" || otsSignedAttrsState === "warn") {
+        anchorNote = " WARNING: these SignedAttributes carry an OpenTimestamps anchor (1.3.6.1.4.1.65834.1.5) that did NOT check out — see the OpenTimestamps result above. Treat the timing of this key commitment as attested only by the RFC 3161 timestamp.";
+      } else {
+        anchorNote = " These SignedAttributes carry an OpenTimestamps anchor (unsignedAttribute 1.3.6.1.4.1.65834.1.5), but it has not reached a Bitcoin block header yet — it is a calendar commitment, typically confirmed within an hour or two of signing. Until then the timing of this key commitment rests on the RFC 3161 timestamp; re-check this PDF later and the anchor becomes independent, quantum-resistant evidence.";
+      }
+      pqDetail = `${impl.label} (FIPS 204, post-quantum) signature verified over the same SignedAttributes bytes the classical signature covers — so it transitively covers messageDigest = SHA-256(ByteRange), the whole signed revision. The public key (${pqSig.publicKey.length} bytes) matches the SHA-256 committed inside the signed attributes, which binds it to this signer. ${classicalNote}.${anchorNote} Checked locally with @noble/post-quantum — WebCrypto has no ML-DSA yet, in any browser.`;
+    }
+  } catch (e) {
+    if (e instanceof MlDsaUnavailable) {
+      // Capability gap, not a verdict about the document — see MlDsaUnavailable.
+      pqState = "warn";
+      pqDetail = `This PDF carries a post-quantum co-signature, but the ML-DSA implementation could not be loaded, so it was NOT checked: ${e.message}. This says nothing about the document. Under Node, run \`npm install @noble/post-quantum\`; in a browser this means the vendored copy under /vendor/noble/ did not load.`;
+    } else {
+      pqState = "fail";
+      pqDetail = "FAILED: " + e.message;
+    }
+  }
+
   // Display fields.
   // PAdES: TST genTime is AUTHORITATIVE when present; signer-claimed time is
   // unattested. Display order corrected (issue #25 from /cr): TST first.
@@ -2071,9 +2411,52 @@ async function fetchExpectedFreeSignCaSha256() {
       cms:   { ok: cmsOk,   state: cmsState,   detail: cmsDetail },
       chain: { ok: chainOk, state: chainState, detail: chainDetail },
       tst:   { ok: tstOk,   state: tstState,   detail: tstDetail },
-      ots:   { ok: otsOk,   state: otsState,   detail: otsDetail, blockHash: otsBlockHash },
+      ots:   {
+        ok: otsOk, state: otsState, detail: otsDetail, blockHash: otsBlockHash,
+        // The second anchor's own verdict, surfaced for tooling. It has no
+        // tile of its own — it can only pull `ots` down (see check 4b).
+        signedAttrs: {
+          present: otsSignedAttrsPresent,
+          state: otsSignedAttrsState,
+          detail: otsSignedAttrsDetail,
+          blockHash: otsSignedAttrsBlockHash,
+        },
+      },
       evidence: { ok: evidenceState === "ok", state: evidenceState, detail: evidenceDetail, data: evidenceData },
+      pq:    { ok: pqOk,    state: pqState,    detail: pqDetail },
     },
+  };
+}
+
+// FreeSignPqCommitment ::= SEQUENCE { algorithm OID, publicKeyHash OCTET STRING }
+// Exported for test/verifier.test.mjs — hostile attribute bytes reach these
+// parsers directly, so their failure modes are worth pinning.
+export function parsePqCommitment(attr) {
+  if (!attr.valueTlv) throw new Error("PQ commitment attribute has an empty value SET");
+  if (attr.valueTlv.tag !== 0x30) throw new Error("PQ commitment attribute value is not a SEQUENCE");
+  const kids = childrenOf(attr.buf, attr.valueTlv);
+  if (kids.length < 2) throw new Error("PQ commitment attribute has too few fields");
+  if (kids[0].tag !== 0x06) throw new Error("PQ commitment algorithm is not an OID");
+  if (kids[1].tag !== 0x04) throw new Error("PQ commitment publicKeyHash is not an OCTET STRING");
+  const publicKeyHash = attr.buf.slice(kids[1].start, kids[1].end);
+  if (publicKeyHash.length !== 32) throw new Error("PQ commitment publicKeyHash is not a 32-byte SHA-256");
+  return { algOid: decodeOid(attr.buf, kids[0].start, kids[0].end), publicKeyHash };
+}
+
+// FreeSignPqSignature ::= SEQUENCE { algorithm OID, publicKey OCTET STRING,
+//                                    signature OCTET STRING }
+export function parsePqSignature(attr) {
+  if (!attr.valueTlv) throw new Error("PQ signature attribute has an empty value SET");
+  if (attr.valueTlv.tag !== 0x30) throw new Error("PQ signature attribute value is not a SEQUENCE");
+  const kids = childrenOf(attr.buf, attr.valueTlv);
+  if (kids.length < 3) throw new Error("PQ signature attribute has too few fields");
+  if (kids[0].tag !== 0x06) throw new Error("PQ signature algorithm is not an OID");
+  if (kids[1].tag !== 0x04) throw new Error("PQ signature publicKey is not an OCTET STRING");
+  if (kids[2].tag !== 0x04) throw new Error("PQ signature value is not an OCTET STRING");
+  return {
+    algOid: decodeOid(attr.buf, kids[0].start, kids[0].end),
+    publicKey: attr.buf.slice(kids[1].start, kids[1].end),
+    signature: attr.buf.slice(kids[2].start, kids[2].end),
   };
 }
 
@@ -2153,7 +2536,11 @@ async function tryUpgradeOtsTimestamp(timestampBytes, msgBytes, { fetchImpl, sig
  * PDF carries a calendar-only proof, queries public calendars for the BTC
  * upgrade before showing the hourglass state.
  */
-async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTimeMs, fetchImpl, signal, timeoutMs } = {}) {
+async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTimeMs, fetchImpl, signal, timeoutMs, commitmentLabel, skipCalendarUpgrade = false } = {}) {
+  // `commitmentLabel` names what the proof is supposed to commit to. Defaults
+  // to the document anchor's SHA-256(ByteRange); the SignedAttributes anchor
+  // (…65834.1.5) passes its own so a mismatch message says which digest broke.
+  const label = commitmentLabel || "SHA-256(ByteRange)";
   if (otsBytes.length < OTS_MAGIC.length + 1 + 1 + 32) throw new Error(".ots truncated");
   for (let i = 0; i < OTS_MAGIC.length; i += 1) {
     if (otsBytes[i] !== OTS_MAGIC[i]) throw new Error(".ots magic mismatch");
@@ -2164,7 +2551,7 @@ async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTime
   const msgStart = OTS_MAGIC.length + 1 + 1;
   const otsMsg = otsBytes.slice(msgStart, msgStart + 32);
   if (!bytesEq(otsMsg, byteRangeDigest)) {
-    throw new Error(".ots commits to a different digest than SHA-256(ByteRange) — document was modified after signing");
+    throw new Error(`.ots commits to a different digest than ${label} — content was modified after signing`);
   }
   const anchoredHashHex = toHex(otsMsg);
   const embeddedBlob = otsBytes.slice(msgStart + 32);
@@ -2180,7 +2567,7 @@ async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTime
   // (secu2.md finding) — it stays a non-confirming "waiting".
   let btc = findBitcoinAttestation(timestampBlob);
   const btcFromEmbedded = btc.found;
-  if (!btc.found) {
+  if (!btc.found && !skipCalendarUpgrade) {
     const up = await tryUpgradeOtsTimestamp(timestampBlob, otsMsg, { fetchImpl, signal, timeoutMs });
     if (up.upgraded) {
       upgradedFromCalendar = up.calendarUrl;
@@ -2241,7 +2628,7 @@ async function evaluateEmbeddedOtsProof(otsBytes, byteRangeDigest, { signingTime
     ok: false,
     state: "waiting",
     blockHash: null,
-    detail: `OpenTimestamps proof embedded (${otsBytes.length} bytes) and matches SHA-256(ByteRange). Public calendars were queried; Bitcoin confirmation is still pending (typically within about an hour of signing). This expected right after signing does NOT reduce signature validity.`,
+    detail: `OpenTimestamps proof embedded (${otsBytes.length} bytes) and matches ${label}. Public calendars were queried; Bitcoin confirmation is still pending (typically within about an hour of signing). This expected right after signing does NOT reduce signature validity.`,
   };
 }
 
@@ -2287,9 +2674,19 @@ async function fetchBlockHashSilently(height) {
   }
 }
 
+// The checks that decide the page-level verdict. A "fail" in any of them turns
+// the banner red; a "warn" withholds the green one. All six are load-bearing
+// because four of them (tst, ots, evidence, pq) live wholly or partly in CMS
+// attributes inside the mutable /Contents gap: an attacker can edit those
+// without breaking cms/chain, so leaving one out of this list means shipping a
+// PASS on a document we know was tampered with. Exported so
+// test/verifier.test.mjs can pin the set and so the OSS mirror's CLI (which
+// duplicates it as FATAL_CHECKS) can be diffed against it.
+export const FATAL_CHECK_NAMES = ["cms", "chain", "tst", "ots", "evidence", "pq"];
+
 // The result shape rendered for a signature whose CMS could not even be
 // parsed. It MUST carry every check key renderResultIntoBlock reads
-// (cms/chain/tst/ots/evidence) — a missing key throws inside the renderer and
+// (cms/chain/tst/ots/evidence/pq) — a missing key throws inside the renderer and
 // aborts the whole block, which in a multi-signature PDF would suppress every
 // other signature's result too. Exported so test/verifier.test.mjs can pin
 // that contract.
@@ -2303,6 +2700,7 @@ export function parseErrorResult(message) {
       tst:      { ok: false, state: "fail", detail: notEval },
       ots:      { ok: false, state: "fail", detail: notEval, blockHash: null },
       evidence: { ok: false, state: "fail", detail: notEval },
+      pq:       { ok: false, state: "fail", detail: notEval },
     },
   };
 }
@@ -2365,9 +2763,24 @@ function setStatus(msg, kind = "info") {
     return;
   }
   els.status.hidden = false;
-  els.status.textContent = msg;
+  const isOk = kind === "ok";
+  if (isOk) {
+    // Fully-valid verdict: lead with the same big green check the homepage
+    // shows after signing (.receipt-check). Icon markup is static; the message
+    // stays a text node so app-generated copy is never parsed as HTML.
+    const icon = document.createElement("span");
+    icon.className = "verify-status-check";
+    icon.setAttribute("aria-hidden", "true");
+    icon.innerHTML =
+      '<svg viewBox="0 0 16 16" width="22" height="22"><path d="M3.5 8.5 6.5 11.5 12.5 5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const text = document.createElement("span");
+    text.textContent = msg;
+    els.status.replaceChildren(icon, text);
+  } else {
+    els.status.textContent = msg;
+  }
   els.status.classList.toggle("is-error", kind === "error");
-  els.status.classList.toggle("is-ok", kind === "ok");
+  els.status.classList.toggle("is-ok", isOk);
   // A caveat banner (e.g. self-signed leaf): deliberately NOT green. Falls back
   // to neutral styling where .is-warn is unstyled — the point is to withhold the
   // reassuring green "valid" presentation, not to look like an error.
@@ -2391,7 +2804,7 @@ function setPanelStatusInitial() {
     valueEl.replaceChildren(
       Object.assign(document.createElement("span"), {
         className: "panel-status-value-long",
-        textContent: "Drop a PDF to run five checks locally",
+        textContent: "Drop a PDF to run six checks locally",
       }),
       Object.assign(document.createElement("span"), {
         className: "panel-status-value-short",
@@ -2496,7 +2909,19 @@ function renderResultIntoBlock(block, result) {
   renderCheck(block.querySelector("[data-check='chain']"), result.checks.chain.state, chainSummary[result.checks.chain.state] || "", result.checks.chain.detail);
   renderCheck(block.querySelector("[data-check='tst']"),   result.checks.tst.state,   tstSummary[result.checks.tst.state]     || "", result.checks.tst.detail);
   renderCheck(block.querySelector("[data-check='ots']"),   result.checks.ots.state,   otsSummary[result.checks.ots.state]     || "", result.checks.ots.detail);
+  const pqSummary = {
+    ok:   "Post-quantum ML-DSA co-signature verified over the same signed attributes as the classical signature.",
+    fail: "Post-quantum co-signature is present but broken, or the signed commitment to it was left dangling — see details.",
+    info: "No post-quantum co-signature. A FreeSign-specific addition; no other vendor emits one and no viewer requires it. Doesn't reduce signature validity.",
+    warn: "Post-quantum co-signature present but not counted — either it isn't bound to the signer, the classical signature above failed, or the ML-DSA library could not be loaded. See details.",
+  };
   renderCheck(block.querySelector("[data-check='evidence']"), result.checks.evidence.state, evidenceSummary[result.checks.evidence.state] || "", result.checks.evidence.detail);
+  // The PQ tile is optional in the DOM: older cached verify.html has no such
+  // element, and a missing tile must not abort the whole render.
+  const pqEl = block.querySelector("[data-check='pq']");
+  if (pqEl && result.checks.pq) {
+    renderCheck(pqEl, result.checks.pq.state, pqSummary[result.checks.pq.state] || "", result.checks.pq.detail);
+  }
   updateAatlTile(block, result);
 }
 
@@ -2512,7 +2937,7 @@ async function handleFile(file) {
     return;
   }
   setStatus(`Verifying ${file.name} (${formatBytes(file.size)}) — fully in this browser, no upload.`);
-  setPanelStatus("Running CMS · X.509 · RFC 3161 · OpenTimestamps · evidence checks…", "CHECKING");
+  setPanelStatus("Running CMS · X.509 · RFC 3161 · OpenTimestamps · evidence · post-quantum checks…", "CHECKING");
   // Clear previous results.
   while (els.results.firstChild) els.results.removeChild(els.results.firstChild);
   try {
@@ -2553,22 +2978,20 @@ async function handleFile(file) {
             auditEnvelopeIds.push(evEnvId);
           }
         }
-        const sigFail = result.checks.cms.state === "fail"
-          || result.checks.chain.state === "fail"
-          || result.checks.tst.state === "fail"
-          || result.checks.ots.state === "fail"
-          || result.checks.evidence.state === "fail";
+        // Every load-bearing check counts, `pq` included: the post-quantum half
+        // lives in the mutable /Contents gap, so stripping or swapping it leaves
+        // cms+chain green — a verdict that ignored checks.pq would show PASS on
+        // exactly the tampering that check exists to catch. Keep this set in
+        // lock-step with FATAL_CHECKS in the OSS mirror's examples/verify-pdf.mjs
+        // (tools/verifier-oss-template/), which claims to mirror it exactly.
+        const sigFail = FATAL_CHECK_NAMES.some((name) => result.checks[name]?.state === "fail");
         // "warn" (e.g. a self-signed leaf whose identity is self-asserted) is NOT
         // a green outcome — anyone can mint a self-signed cert claiming any name.
         // Treat warn as a caveat that withholds the green "valid" banner, while
         // not being an outright failure. Only ok/info count toward all-core-ok.
         const sigCoreOk = result.checks.cms.state === "ok"
           && (result.checks.chain.state === "ok" || result.checks.chain.state === "info");
-        const sigCaveat = result.checks.cms.state === "warn"
-          || result.checks.chain.state === "warn"
-          || result.checks.tst.state === "warn"
-          || result.checks.ots.state === "warn"
-          || result.checks.evidence.state === "warn";
+        const sigCaveat = FATAL_CHECK_NAMES.some((name) => result.checks[name]?.state === "warn");
         if (sigFail) anyFail = true;
         if (sigCaveat) anyCaveat = true;
         if (!sigCoreOk) allCoreOk = false;
@@ -2613,7 +3036,7 @@ async function handleFile(file) {
     } else if (allCoreOk) {
       const expiredNote = priorExpired ? ` Note: signature ${priorExpired.index} of ${priorExpired.total}'s cert expired post-signing (legitimate aging, not tampering).` : "";
       setStatus(`Verification complete — ${sigs.length === 1 ? "signature is valid" : `all ${sigs.length} signatures verify`}.${expiredNote}`, "ok");
-      setPanelStatus("CMS · X.509 · RFC 3161 · OpenTimestamps · evidence — core checks passed", "PASS", true);
+      setPanelStatus("CMS · X.509 · RFC 3161 · OpenTimestamps · evidence · post-quantum — core checks passed", "PASS", true);
     } else {
       setStatus("Verification complete — see per-signature details.", "info");
       setPanelStatus("Verification finished — see per-signature details", "REVIEW");

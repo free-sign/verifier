@@ -33,10 +33,12 @@ closed-source product.
 
 # Part 1 — Verify a FreeSign PDF offline (this library)
 
-This repository is a **dependency-free ES-module library**: no UI, no
-framework, no install step. It runs unchanged in a browser and in Node ≥ 18
-(both provide the WebCrypto, `fetch`, `btoa`, and `AbortSignal.timeout` globals
-it uses). **The PDF you check never leaves the machine.** The library files
+This repository is an **ES-module library**: no UI, no framework, no build
+step. It runs unchanged in a browser and in Node ≥ 18 (both provide the
+WebCrypto, `fetch`, `btoa`, and `AbortSignal.timeout` globals it uses). Every
+classical check runs on those built-ins alone; the one dependency
+(`@noble/post-quantum`) is imported lazily and only for the ML-DSA
+post-quantum co-signature. **The PDF you check never leaves the machine.** The library files
 (`verify.js`, `ots-timestamp.js`, `audit-verify.js`, `session.js`) are copied
 **byte-for-byte** from the FreeSign codebase that serves `/verify` — the code
 you audit here is the code that actually checks signatures. Do not edit them
@@ -54,8 +56,12 @@ upload the PDF anywhere to "check" it.
 node examples/verify-pdf.mjs path/to/signed.pdf
 ```
 
-No `npm install` — the library has zero dependencies; Node ≥ 18 is enough.
-Expected output (one block per signature):
+Node ≥ 18 is enough for the classical checks — no `npm install` needed. The
+post-quantum check is the one exception: it lazily imports
+`@noble/post-quantum`, and without it that check reports a `warn` caveat
+("could not be loaded") while every other check still runs. Run `npm install`
+in this repo to check post-quantum-sealed PDFs. Expected output (one block per
+signature):
 
 ```
 Signatures found: 1
@@ -66,9 +72,15 @@ Signature 1 — Jane Doe <jane@example.com>
   RFC 3161 timestamp   ✓ ok
   OpenTimestamps       ✓ ok
   Embedded evidence    ✓ ok
+  Post-quantum (ML-DSA)✓ ok
   ...
-PASS: every signature is cryptographically intact (CMS + certificate chain).
+PASS: every signature passes all load-bearing checks (CMS, certificate chain,
+timestamp, OpenTimestamps, evidence).
 ```
+
+The process exits non-zero when **any** of the six load-bearing checks is in
+state `fail` — the same condition the hosted `/verify` page uses to turn its
+verdict red.
 
 Re-derive the tamper-evident audit chain yourself:
 
@@ -88,7 +100,8 @@ const bytes = new Uint8Array(/* the PDF */);
 const sigs = extractSignatures(bytes);          // one entry per CMS signature
 for (const sig of sigs) {
   const result = await verifySignature(sig);
-  // result.checks.{cms,chain,tst,ots,evidence} → { state, ok, detail }
+  // result.checks.{cms,chain,tst,ots,evidence,pq} → { state, ok, detail }
+  // (checks.ots.signedAttrs carries the second, SignedAttributes anchor)
   // result.summary.{signerName,signerEmail,signingTime,cmsProfile,caSubject,
   //                 byteRangeSha256,…}
 }
@@ -106,15 +119,30 @@ piece.
 
 ## Reading the result — integrity vs. trust (two separate verdicts)
 
-- **`cms` + `chain` are the integrity verdict.** They answer *is the maths
+- **`cms` + `chain` are the core integrity verdict.** They answer *is the maths
   valid and the document unmodified?* — a pure cryptographic fact that does
   **not** depend on whether your software already trusts the FreeSign CA.
 - A check fails integrity **only when its `state` is `"fail"`**. The full state
   enum is `"ok" | "warn" | "info" | "waiting" | "fail"`. A `"warn"` is a real,
   distinct outcome (e.g. the self-signed `freesign_verified_seal` platform-seal
   cert) — a valid signature carrying a *trust caveat*, **not** a failure.
-- **`tst` / `ots` / `evidence` corroborate** but do not by themselves break
-  integrity.
+- **All six checks are load-bearing**: a `"fail"` in `cms`, `chain`, `tst`,
+  `ots`, `evidence` **or** `pq` is a failed verdict, matching the hosted
+  `/verify` page. `tst`/`ots` material and the ML-DSA signature attribute are
+  CMS *unsigned* attributes — outside the outer signature — so treating only
+  `cms` + `chain` as fatal would silently accept a tamper of exactly the parts
+  an attacker can reach.
+- The flip side: an unsigned attribute **alone** can never turn a document red.
+  Anyone can append one to anyone's PDF, so a broken OpenTimestamps anchor or an
+  ML-DSA key nothing commits to, next to an intact classical signature, is a
+  `"warn"` — not a `"fail"`. What does fail is tampering the signer vouched
+  for: a stripped ML-DSA signature whose *signed* commitment is still present,
+  or an evidence record (a **signed** attribute) that no longer re-verifies.
+- **`pq` is `"info"`, never a defect, when absent.** Documents sealed before the
+  post-quantum co-signature existed — and every non-FreeSign PDF — carry none.
+  It is also `"warn"` rather than `"fail"` when `@noble/post-quantum` is not
+  installed: a missing library is a capability gap here, not a verdict about the
+  document.
 - **Not on the Adobe AATL.** FreeSign runs its own CA, so Adobe Reader shows a
   yellow trust banner by default — a *trust-list* statement, not an *integrity*
   failure. A FreeSign signature can be cryptographically perfect and still show
@@ -127,8 +155,9 @@ piece.
 | **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — content unmodified since signing. |
 | **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
 | **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
-| **OpenTimestamps proof** | A timestamp anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert vanish. The proof commits to the signature's **ByteRange SHA-256** (`result.summary.byteRangeSha256`), **not** `SHA-256(signed.pdf)`. |
-| **Embedded evidence record** | Consent text, identity method (OTP or passkey), canonical signed payload, and request fingerprint, embedded as a CMS unsigned attribute under PEN `1.3.6.1.4.1.65834`. |
+| **OpenTimestamps proofs** | Timestamps anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert vanish. A seal carries **two**, both reported under this one verdict: one over the signed document (`…65834.1.1`), committing to the signature's **ByteRange SHA-256** (`result.summary.byteRangeSha256`), **not** `SHA-256(signed.pdf)`; and one over the CMS SignedAttributes (`…65834.1.5`, surfaced as `checks.ots.signedAttrs`), which is what dates the post-quantum key commitment. |
+| **Embedded evidence record** | Consent text, identity method (OTP or passkey), canonical signed payload, and request fingerprint, embedded as a CMS **signed** attribute `1.3.6.1.4.1.65834.1.2` (FreeSign's PEN) — editing it invalidates the CMS signature, and a record found only in the *unsigned* set is rejected. |
+| **Post-quantum co-signature** | A second signature over the same SignedAttributes, made with ML-DSA (FIPS 204) and verified with `@noble/post-quantum`. Present only on seals made with the post-quantum option on. Its public key is committed to *inside* the signed attributes (`…65834.1.3`), so today's classical signature is what binds that key to the signer; the signature itself rides as unsignedAttribute `…65834.1.4`. |
 | **Audit hash chain** | `verifyAuditChain` replays the per-document event log; every event is hash-chained to the previous one, and the optional attested head catches a re-forged-but-consistent chain. |
 
 ## Cross-check with other tools
@@ -146,12 +175,20 @@ and the signed ByteRange to `content.bin` first, then:
 openssl cms -verify -in sig.der -inform DER -content content.bin -noverify
 ```
 
-**OpenTimestamps:** verify the `.ots` proof against the **ByteRange digest**,
-never the whole file:
+**OpenTimestamps:** verify each `.ots` proof against the digest that anchor
+claims, never the whole file — the document anchor against the **ByteRange
+digest**, the SignedAttributes anchor against `seal_signed_attrs_sha256`
+(`/api/receipts/{id}` lists both anchors with their `kind`):
 
 ```sh
 ots verify -d <byteRangeSha256-hex> proof.ots
 ```
+
+Note that ML-DSA is not in WebCrypto (nor in openssl's PDF tooling), so no
+third-party PDF validator reports the post-quantum co-signature today: it is a
+FreeSign-specific attribute and only this library checks it. `openssl cms
+-verify` and pyHanko validate the file exactly as they would without it —
+that is the point of keeping it a co-signature.
 
 The published FreeSign CA certificate (to pin/name the issuer):
 
@@ -392,6 +429,17 @@ browser session — refresh without ?envelope=… to start a new ceremony."
   CMS (and the previously-issued leaf cert). The response carries
   `seal_profile = "PAdES-B-T"` when an RFC 3161 timestamp was attached
   (DigiCert by default) and `"PAdES-B-B"` when no TSA is configured.
+  On free-sign.com every seal additionally carries an ML-DSA (FIPS 204)
+  post-quantum co-signature, reported as
+  `pq_signature: {variant, pubkey_sha256, signature_sha256}` (null on a
+  deployment running classical-only). It is an addition, never a
+  substitution — the SignerInfo signature stays ECDSA P-256, so Adobe,
+  pyHanko and openssl validate the file exactly as before. The ML-DSA
+  public key is committed to inside the CMS signedAttrs (OID
+  `1.3.6.1.4.1.65834.1.3`) and the signature rides as an unsignedAttr
+  (`…1.4`), over the same SignedAttributes bytes the classical signature
+  covers. Its absence on an older PDF is informational, never a defect;
+  this repo's `verifySignature` reports it as `checks.pq`.
   When the deployment publishes a FreeSign CA CRL the response also
   carries `dss: {ca_cert_base64, crl_base64}`; the browser then appends
   one more incremental update — a `/DSS` revision with the cert chain +
@@ -408,10 +456,19 @@ browser session — refresh without ?envelope=… to start a new ceremony."
   digest — what the `/Sig` ByteRange covers), NOT the file hash; an
   external verifier runs `ots verify --digest <byterange_sha256> proof.ots`,
   matching the hash returned by `/seal` and stored on the envelope row.
-  The response carries `ots_anchor: {id, anchored_hash, status,
+  The response carries `ots_anchor: {id, kind, anchored_hash, status,
   embedded_in_cms, calendar_urls, pending_submitted_at, proof_download}`
   where status is `pending` (got calendar attestation, in CMS) or
   `deferred` (cron retry; PDF will not have OTS attr).
+  A **second anchor** rides alongside it as `ots_anchor_signed_attrs`
+  (both are also in the `ots_anchors` array): same shape, `kind:
+  "signed_attrs"`, committing to `seal_signed_attrs_sha256` =
+  SHA-256(CMS SignedAttributes) and embedded as unsignedAttribute OID
+  `1.3.6.1.4.1.65834.1.5`. The document anchor dates the file; this one
+  dates the attributes — including the post-quantum ML-DSA key commitment
+  — so verify it with
+  `ots verify --digest <seal_signed_attrs_sha256> proof.ots`. This repo's
+  verifier reports it under `checks.ots.signedAttrs`.
 - `POST /api/envelopes/{id}/platform-seal`: optional second signature
   variant (`freesign_verified_seal`). The browser prepares a separate
   placeholder and sends only its `byterange_sha256`; the Worker signs with
@@ -451,8 +508,9 @@ mismatch, freezing the audit chain in signed evidence (security audit G-01).
 - `GET /api/receipts/{id}`: fetch evidence — `{envelope, receipts, ots_anchors}`.
   The envelope object includes `final_pdf_sha256`, `final_signature_base64url`,
   and `final_payload_json` once `/finalize` has run. `ots_anchors` is the
-  list of OpenTimestamps anchors produced for this envelope (one per /seal
-  call → so multi-signer envelopes have N entries) with `status`
+  list of OpenTimestamps anchors produced for this envelope (TWO per /seal
+  call — `kind: "byterange"` and `kind: "signed_attrs"` — so multi-signer
+  envelopes have 2N entries) with `status`
   (`pending` | `confirmed` | `deferred`), `calendar_urls`,
   `pending_submitted_at`, the download URL, and — once a server-side cron
   has polled the calendar and seen public block-header confirmation (typically ~1-2 h
@@ -500,8 +558,10 @@ requests embedded in them.
 ## Evidence Bundle
 
 The ceremony produces an evidence JSON. It is NOT a separate download — the
-pre-seal half is embedded INSIDE the signed PDF, in the signer's CMS as an
-unsignedAttribute (OID `1.3.6.1.4.1.65834.1.2`). Every signer's CMS sits in
+pre-seal half is embedded INSIDE the signed PDF, in the signer's CMS as a
+signedAttribute (OID `1.3.6.1.4.1.65834.1.2`) — editing it invalidates the
+CMS signature, and a record found only in the unsigned set is rejected as a
+failed `checks.evidence`. Every signer's CMS sits in
 their own signed revision, so a multi-signer PDF carries every signer's
 record. Extract it with any CMS parser (`openssl cms`, the `/verify` page, or
 this repo's `verifySignature` which surfaces it under
@@ -522,10 +582,15 @@ sign the final PDF bytes, so they cannot live inside those bytes):
 - Server seal: `seal: {cms_sha256, cert_sha256,
   signer_cert_serial_hex, signer_cert_not_after, seal_ca_mode,
   seal_profile, signed_at}`.
-- Timestamp proof: `ots_anchor: {id, anchored_hash, status,
+- Timestamp proof: `ots_anchor: {id, kind, anchored_hash, status,
   embedded_in_cms, calendar_urls, pending_submitted_at, proof_download}`.
   `status` is `pending`/`deferred`/`confirmed`; the `btc_block_*` fields
-  land after the BTC-upgrade cron runs (~1-2 h).
+  land after the BTC-upgrade cron runs (~1-2 h). Each seal has two anchors
+  (`kind`: `byterange` = the document, `signed_attrs` =
+  SHA-256(SignedAttributes)); `/api/receipts/{id}` lists both.
+- Post-quantum receipt: `pq_signature: {variant, pubkey_sha256,
+  signature_sha256}` — null on a classical-only deployment, and absent
+  from documents sealed before the co-signature shipped.
 - Final attestation: `final_pdf_sha256`, `final_payload`,
   `final_signature_base64url`.
 
@@ -564,8 +629,12 @@ For a non-technical recipient who just got a FreeSign-signed PDF:
 - Direct them to `https://free-sign.com/verify` and have them drag the
   PDF into the dropzone. The page runs entirely in their browser
   (same privacy invariant as `/sign` — the file never leaves their
-  machine) and reports the cryptographic checks. The same code runs as
-  this repo's `verify.js`.
+  machine) and reports six cryptographic checks: CMS signature, leaf
+  cert chain back to the FreeSign CA, RFC 3161 timestamp from DigiCert,
+  the OpenTimestamps Bitcoin anchors (both kinds under one verdict), the
+  embedded evidence record, and the ML-DSA post-quantum co-signature. A
+  seventh tile is the Adobe AATL trust status — yellow by default. The
+  same code runs as this repo's `verify.js`.
 - For pinning the CA out of band, the SHA-256 fingerprint is published
   at `/.well-known/free-sign-signing-ca.sha256.txt`, and the FDF
   response (`/freesign-trust.fdf`) carries it in the `x-freesign-ca-sha256`

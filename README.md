@@ -8,10 +8,12 @@ This repository contains the **exact verification code** that runs at
 can read it, audit it, and run it offline to check a FreeSign-signed PDF
 **without trusting the FreeSign service at all**.
 
-It is a dependency-free ES-module library: no UI, no framework, no install step.
-It runs unchanged in a browser and in Node ≥ 18 (both provide the WebCrypto,
-`fetch`, `btoa` and `AbortSignal.timeout` globals it uses). The PDF you check
-never leaves your machine.
+It is an ES-module library: no UI, no framework, no build step. It runs
+unchanged in a browser and in Node ≥ 18 (both provide the WebCrypto, `fetch`,
+`btoa` and `AbortSignal.timeout` globals it uses). Every classical check runs on
+those built-ins alone — the single dependency, `@noble/post-quantum`, is
+imported lazily and only when a PDF carries the ML-DSA post-quantum
+co-signature. The PDF you check never leaves your machine.
 
 > **This is a generated mirror.** The library files (`verify.js`,
 > `ots-timestamp.js`, `audit-verify.js`, `session.js`) are copied **byte-for-byte**
@@ -30,7 +32,10 @@ cd verifier
 node examples/verify-pdf.mjs path/to/signed.pdf
 ```
 
-No `npm install` — the library has **zero dependencies**. You need only Node ≥ 18.
+No `npm install` for the classical checks — they run on Node built-ins alone.
+Only the post-quantum check needs one dependency (`@noble/post-quantum`, loaded
+lazily); without it that check reports a caveat and every other check still runs.
+You need Node ≥ 18.
 
 ```
 Signatures found: 1
@@ -41,6 +46,7 @@ Signature 1 — Jane Doe <jane@example.com>
   RFC 3161 timestamp   ✓ ok
   OpenTimestamps       ✓ ok
   Embedded evidence    ✓ ok
+  Post-quantum (ML-DSA)✓ ok
   ...
 PASS: every signature is cryptographically intact (CMS + certificate chain).
 ```
@@ -69,7 +75,7 @@ const bytes = new Uint8Array(/* the PDF */);
 const sigs = extractSignatures(bytes);          // one entry per CMS signature
 for (const sig of sigs) {
   const result = await verifySignature(sig);
-  // result.checks.{cms,chain,tst,ots,evidence} → { state, ok, detail }
+  // result.checks.{cms,chain,tst,ots,evidence,pq} → { state, ok, detail }
   // result.summary.{signerName,signerEmail,signingTime,cmsProfile,caSubject,…}
 }
 
@@ -114,8 +120,9 @@ For **each signature** in the PDF:
 | **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — content unmodified since signing. |
 | **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
 | **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
-| **OpenTimestamps proof** | An independent timestamp anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert both vanish. When the embedded proof is still calendar-only, the verifier queries public OTS calendars for the Bitcoin upgrade before reporting. |
-| **Embedded evidence record** | The consent text, identity method (OTP or passkey), canonical signed payload and request fingerprint FreeSign embedded inside the signature (CMS unsigned attribute under PEN `1.3.6.1.4.1.65834`). |
+| **OpenTimestamps proofs** | Independent timestamps anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert both vanish. A FreeSign seal carries two, both reported under this one verdict: one over the signed document (`…65834.1.1`) and one over the CMS SignedAttributes (`…65834.1.5`, surfaced as `checks.ots.signedAttrs`) — the latter is what dates the post-quantum key commitment. When an embedded proof is still calendar-only, the verifier queries public OTS calendars for the Bitcoin upgrade before reporting. |
+| **Embedded evidence record** | The consent text, identity method (OTP or passkey), canonical signed payload and request fingerprint FreeSign embedded inside the signature (CMS **signed** attribute `1.3.6.1.4.1.65834.1.2`, under FreeSign's PEN — editing it invalidates the CMS signature; a record found only in the unsigned set is rejected). |
+| **Post-quantum co-signature** | A second signature over the same signed attributes, made with ML-DSA (FIPS 204). Present only on documents sealed with the post-quantum option on; its public key is committed to *inside* the signed attributes, so the classical signature is what binds it to the signer. Verified with [`@noble/post-quantum`](https://github.com/paulmillr/noble-post-quantum) — the one check that needs `npm install`; every other check runs on Node built-ins. |
 | **Audit hash chain** | `verifyAuditChain` replays the per-document event log; every event is hash-chained to the previous one, and the optional attested head catches a re-forged but internally consistent chain. |
 
 For the full signing & cryptography model (ephemeral leaf certs under an
@@ -162,12 +169,15 @@ Full extract-then-verify walkthrough:
 pyhanko sign validate --pretty-print signed.pdf            # PAdES validation
 ```
 
-**OpenTimestamps:** the embedded FreeSign `.ots` proof commits to the signature's
-**ByteRange SHA-256** (the bytes the CMS signs), **not** to `SHA-256(signed.pdf)`.
-So a bare `ots verify signed.pdf.ots` verifies the wrong digest and will not
-match. Fetch the proof from the receipt's proof URL
-(`/api/envelopes/{id}/proof.ots`) and verify it against the ByteRange digest the
-verifier reports (`result.summary.byteRangeSha256`):
+**OpenTimestamps:** the embedded FreeSign `.ots` proofs commit to the signature's
+**ByteRange SHA-256** (the bytes the CMS signs) and to **SHA-256 of the CMS
+SignedAttributes** — **not** to `SHA-256(signed.pdf)`. So a bare
+`ots verify signed.pdf.ots` verifies the wrong digest and will not match. Fetch a
+proof from the receipt's proof URL
+(`/api/envelopes/{id}/anchors/{anchor_id}/proof.ots`; `/api/receipts/{id}` lists
+both anchors with their `kind`) and verify it against the digest that anchor
+claims — for the document anchor, the one the verifier reports as
+`result.summary.byteRangeSha256`:
 
 ```sh
 # Verify the OTS proof against the ByteRange digest (hex), not the whole file:
