@@ -115,7 +115,7 @@ if (!allIntegrityOk) {
   process.exit(1);
 }
 if (anyCaveat) {
-  console.log("PASS (with trust caveat): every load-bearing check (CMS, certificate chain, timestamp, OpenTimestamps, evidence) is intact, but at least one carries a ⚠ warn — e.g. a self-signed / platform-seal cert that is not anchored to a public trust root. Confirm the cert fingerprint out of band.");
+  console.log("PASS (with trust caveat): every load-bearing check (CMS, certificate chain, timestamp, OpenTimestamps, evidence) is intact, but at least one carries a ⚠ warn — e.g. a self-signed / platform-seal cert that is not anchored to a public trust root (confirm the cert fingerprint out of band), or a legacy evidence record outside the signed attributes (ignored).");
 } else {
   console.log("PASS: every signature passes all load-bearing checks (CMS, certificate chain, timestamp, OpenTimestamps, evidence).");
 }

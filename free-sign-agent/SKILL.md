@@ -156,7 +156,7 @@ piece.
 | **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
 | **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
 | **OpenTimestamps proofs** | Timestamps anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert vanish. A seal carries **two**, both reported under this one verdict: one over the signed document (`…65834.1.1`), committing to the signature's **ByteRange SHA-256** (`result.summary.byteRangeSha256`), **not** `SHA-256(signed.pdf)`; and one over the CMS SignedAttributes (`…65834.1.5`, surfaced as `checks.ots.signedAttrs`), which is what dates the post-quantum key commitment. |
-| **Embedded evidence record** | Consent text, identity method (OTP or passkey), canonical signed payload, and request fingerprint, embedded as a CMS **signed** attribute `1.3.6.1.4.1.65834.1.2` (FreeSign's PEN) — editing it invalidates the CMS signature, and a record found only in the *unsigned* set is rejected. |
+| **Embedded evidence record** | Consent text, identity method (OTP or passkey), canonical signed payload, and request fingerprint, embedded as a CMS **signed** attribute `1.3.6.1.4.1.65834.1.2` (FreeSign's PEN) — editing it invalidates the CMS signature, and a record found only in the *unsigned* set (pre-2026-06 seals, or appended by anyone) is ignored and reported as a non-fatal `warn` caveat — never trusted. |
 | **Post-quantum co-signature** | A second signature over the same SignedAttributes, made with ML-DSA (FIPS 204) and verified with `@noble/post-quantum`. Present only on seals made with the post-quantum option on. Its public key is committed to *inside* the signed attributes (`…65834.1.3`), so today's classical signature is what binds that key to the signer; the signature itself rides as unsignedAttribute `…65834.1.4`. |
 | **Audit hash chain** | `verifyAuditChain` replays the per-document event log; every event is hash-chained to the previous one, and the optional attested head catches a re-forged-but-consistent chain. |
 
@@ -560,8 +560,9 @@ requests embedded in them.
 The ceremony produces an evidence JSON. It is NOT a separate download — the
 pre-seal half is embedded INSIDE the signed PDF, in the signer's CMS as a
 signedAttribute (OID `1.3.6.1.4.1.65834.1.2`) — editing it invalidates the
-CMS signature, and a record found only in the unsigned set is rejected as a
-failed `checks.evidence`. Every signer's CMS sits in
+CMS signature, and a record found only in the unsigned set (where older
+seals carried it) is ignored and reported as a `warn` on `checks.evidence` —
+a caveat, not a failure, because anyone can append an unsigned attribute. Every signer's CMS sits in
 their own signed revision, so a multi-signer PDF carries every signer's
 record. Extract it with any CMS parser (`openssl cms`, the `/verify` page, or
 this repo's `verifySignature` which surfaces it under

@@ -2182,8 +2182,13 @@ async function fetchExpectedFreeSignCaSha256() {
       evidenceState = "info";
       evidenceDetail = "No FreeSign evidence record (signedAttribute 1.3.6.1.4.1.65834.1.2). Pre-embedding PDFs and non-FreeSign signatures don't carry one — it does not reduce signature validity.";
     } else if (!signedEvAttr) {
-      evidenceState = "fail";
-      evidenceDetail = "FreeSign evidence record is present only as a CMS unsignedAttribute. That location is not covered by the CMS signature and may be modified without invalidating the PDF signature, so this embedded evidence is not trusted. Re-seal the document with a version that embeds evidence as a signedAttribute.";
+      // `warn`, not `fail`: an unsignedAttr is outside the signature, so ANYONE
+      // can append one to any signed PDF — failing here would let a third party
+      // flip an intact signature red (same reasoning as the PQ signature and
+      // the …65834.1.5 anchor). FreeSign seals made before the evidence moved
+      // into signedAttrs carry it here legitimately; either way it is ignored.
+      evidenceState = "warn";
+      evidenceDetail = "FreeSign evidence record is present only as a CMS unsignedAttribute — the location FreeSign used before the record moved into the signed attributes. That location is not covered by the CMS signature and can be modified (or appended by anyone) without invalidating it, so this record is ignored rather than trusted. The signature itself is unaffected; seals made today embed the record as a signedAttribute.";
     } else {
       if (evAttr.valueTlv.tag !== 0x04) throw new Error("evidence attribute value is not OCTET STRING");
       const ev = JSON.parse(new TextDecoder().decode(evAttr.valueBytes));
@@ -2209,8 +2214,9 @@ async function fetchExpectedFreeSignCaSha256() {
           // (signer_certificate variant) mints a fresh leaf cert per signer
           // with Subject CN = the typed name, and the evidence
           // canonical_payload carries the same name. The evidence attribute is
-          // NOT covered by the outer CMS signature, so a valid record could be
-          // lifted wholesale into a different signer's CMS — verifying its own
+          // a signedAttribute here, but the record's own ECDSA signature is
+          // independent of this CMS, so a whole record could have been carried
+          // over into a different signer's seal — verifying its own
           // self-signature does not prove it belongs here. A name mismatch is
           // a transplant: fail it instead of showing it as this signer's.
           //
@@ -2903,7 +2909,7 @@ function renderResultIntoBlock(block, result) {
     ok:   "FreeSign evidence record embedded in this signer's CMS — its primary signature re-verifies against the embedded public key.",
     fail: "FreeSign evidence record is present but did not re-verify — see details.",
     info: "No FreeSign evidence record embedded. Pre-embedding or non-FreeSign signatures don't carry one; doesn't reduce signature validity.",
-    warn: "FreeSign evidence record embedded but incomplete — see details.",
+    warn: "FreeSign evidence record present but not counted (incomplete, or outside the signed attributes) — see details. Doesn't reduce signature validity.",
   };
   renderCheck(block.querySelector("[data-check='cms']"),   result.checks.cms.state,   cmsSummary[result.checks.cms.state]     || "", result.checks.cms.detail);
   renderCheck(block.querySelector("[data-check='chain']"), result.checks.chain.state, chainSummary[result.checks.chain.state] || "", result.checks.chain.detail);
@@ -2957,6 +2963,7 @@ async function handleFile(file) {
     let anyFail = false;
     let allCoreOk = true;
     let anyCaveat = false; // a non-fatal warn (e.g. self-signed leaf) — green banner is withheld
+    let anyIdentityCaveat = false; // a caveat on the certificate chain (self-asserted / not trust-anchored identity)
     // Envelope ids pulled from embedded FreeSign evidence records — handed to
     // verify-audit.js after the loop so it can fetch + re-verify the audit
     // chain. All signers of one document share one envelope, so this collects
@@ -2967,11 +2974,12 @@ async function handleFile(file) {
       try {
         const result = await verifySignature(sigs[i]);
         renderResultIntoBlock(block, result);
-        // Audit handoff: use the SIGNED canonical_payload.envelope_id (covered by
-        // the evidence record's own ECDSA signature we just re-verified), never
-        // the UNSIGNED top-level evidence.envelope_id (an attacker can repoint
-        // that in the CMS unsignedAttribute without breaking any signature).
-        // Only hand off when the evidence check actually passed.
+        // Audit handoff: use canonical_payload.envelope_id (covered by the
+        // evidence record's own ECDSA signature we just re-verified), never the
+        // cosmetic top-level evidence.envelope_id (outside that signature).
+        // Only hand off when the evidence check passed — i.e. a signedAttribute
+        // record whose own signature re-verified; an unsigned-only record is
+        // `warn` and never reaches here.
         if (result.checks?.evidence?.state === "ok") {
           const evEnvId = result.checks?.evidence?.data?.canonical_payload?.envelope_id;
           if (typeof evEnvId === "string" && /^env_[a-f0-9]{32}$/.test(evEnvId) && !auditEnvelopeIds.includes(evEnvId)) {
@@ -2994,6 +3002,7 @@ async function handleFile(file) {
         const sigCaveat = FATAL_CHECK_NAMES.some((name) => result.checks[name]?.state === "warn");
         if (sigFail) anyFail = true;
         if (sigCaveat) anyCaveat = true;
+        if (result.checks.chain.state === "warn") anyIdentityCaveat = true;
         if (!sigCoreOk) allCoreOk = false;
         // Surface earlier-revision tampering vs cert-expiry separately:
         // tampering breaks documents, expiry is normal long-lived aging.
@@ -3028,11 +3037,20 @@ async function handleFile(file) {
       setStatus("Verification complete — one or more checks did not pass. Expand each tile for details.", "error");
       setPanelStatus("One or more checks did not pass", "REVIEW");
     } else if (anyCaveat) {
-      // Cryptographically intact, but carrying a trust caveat (e.g. a self-signed
-      // leaf). NOT a green banner: the signer identity is self-asserted, so the
-      // recipient must confirm the cert fingerprint out of band before trusting it.
-      setStatus(`Verification complete — ${sigs.length === 1 ? "the signature is cryptographically intact" : `all ${sigs.length} signatures are cryptographically intact`}, but at least one carries a trust caveat (e.g. a self-signed certificate whose identity is NOT third-party-attested). Expand the certificate-chain tile and confirm the signer identity out of band.`, "warn");
-      setPanelStatus("Cryptographically intact — review identity (self-asserted / not trust-anchored)", "REVIEW");
+      // Cryptographically intact, but carrying a caveat. NOT a green banner.
+      // An identity caveat (chain `warn`, e.g. a self-signed leaf / platform
+      // seal) gets the strong wording: the signer identity is self-asserted, so
+      // the recipient must confirm it out of band before trusting it. Other
+      // caveats (e.g. a legacy evidence record in the unsigned set) get the
+      // generic "review the yellow tiles" wording.
+      const intact = sigs.length === 1 ? "the signature is cryptographically intact" : `all ${sigs.length} signatures are cryptographically intact`;
+      if (anyIdentityCaveat) {
+        setStatus(`Verification complete — ${intact}, but at least one uses a self-signed certificate whose identity is NOT third-party-attested. Expand the certificate-chain tile and confirm the signer identity out of band before trusting it. Other yellow tiles, if any, carry further caveats.`, "warn");
+        setPanelStatus("Cryptographically intact — review identity (self-asserted / not trust-anchored)", "REVIEW");
+      } else {
+        setStatus(`Verification complete — ${intact}, but at least one carries a caveat. Expand the yellow tiles for details.`, "warn");
+        setPanelStatus("Cryptographically intact — review the caveats", "REVIEW");
+      }
     } else if (allCoreOk) {
       const expiredNote = priorExpired ? ` Note: signature ${priorExpired.index} of ${priorExpired.total}'s cert expired post-signing (legitimate aging, not tampering).` : "";
       setStatus(`Verification complete — ${sigs.length === 1 ? "signature is valid" : `all ${sigs.length} signatures verify`}.${expiredNote}`, "ok");
