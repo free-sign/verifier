@@ -7,11 +7,13 @@ signed PDFs.
 
 This repository contains the **exact verification code** that runs at
 **[free-sign.com/verify](https://free-sign.com/verify)** — published so anyone
-can read it, audit it, and run it offline to check a FreeSign-signed PDF
-**yourself**. Document integrity, the CMS signature, the RFC 3161 timestamp, the
+can read it, audit it, and run it locally to check a FreeSign-signed PDF
+**yourself** — the PDF never leaves your machine. Document integrity, the CMS signature, the RFC 3161 timestamp, the
 OpenTimestamps anchors and the post-quantum co-signature are checked without
 relying on the FreeSign service; the certificate chain shows the signer identity
-(name + OTP-verified email) that the FreeSign CA vouched for.
+(name + OTP-verified email) that the FreeSign CA vouched for. The cryptographic
+checks need no network; only confirming an OpenTimestamps anchor in Bitcoin
+queries public OTS calendars and a block explorer (`blockstream.info`).
 
 It is an ES-module library: no UI, no framework, no build step. It runs
 unchanged in a browser and in Node ≥ 18 (both provide the WebCrypto, `fetch`,
@@ -109,7 +111,7 @@ still show "not trusted" until you add the FreeSign CA to your trust store.
 
 An [Agent Skill](./free-sign-agent/SKILL.md) ships in this repo
 (`free-sign-agent/SKILL.md`). It teaches an AI agent how to **verify** a
-FreeSign PDF offline with the library above, and how to **sign** one by driving
+FreeSign PDF locally with the library above, and how to **sign** one by driving
 the hosted ceremony at free-sign.com without ever uploading the PDF. Drop it
 into a Claude / agent skills directory, or just read it as a concise operator's
 guide to both flows.

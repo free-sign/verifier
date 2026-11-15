@@ -1,6 +1,6 @@
 ---
 name: free-sign-agent
-description: Use FreeSign — a free e-signature (electronic signature) that runs in the user's browser — to help a user sign or verify a PDF without uploading the PDF to FreeSign. To VERIFY a FreeSign-signed PDF offline, use the verifier library in this repo (verify.js / audit-verify.js + examples/) — no upload, no account, no trust in the FreeSign service. To SIGN, keep PDF bytes local and drive the browser ceremony at free-sign.com; use REST/MCP for hashes and ceremony state only.
+description: Use FreeSign — a free e-signature (electronic signature) that runs in the user's browser — to help a user sign or verify a PDF without uploading the PDF to FreeSign. To VERIFY a FreeSign-signed PDF locally, use the verifier library in this repo (verify.js / audit-verify.js + examples/) — no upload, no account, no reliance on the FreeSign service for the cryptographic checks. To SIGN, keep PDF bytes local and drive the browser ceremony at free-sign.com; use REST/MCP for hashes and ceremony state only.
 ---
 
 # FreeSign Agent
@@ -14,7 +14,7 @@ FreeSign APIs or MCP tools.
 This file ships **inside the open-source verifier repo**
 (`github.com/free-sign/verifier`). That repo is a generated, library-only
 mirror of the verification code that runs at `free-sign.com/verify` — so the
-fastest, no-trust way to **verify** a FreeSign PDF is the library sitting next
+fastest way to **verify** a FreeSign PDF is the library sitting next
 to this file. The **signing** half (everything from "Languages" onward) drives
 the hosted ceremony at `free-sign.com`; the hosted service is a separate,
 closed-source product.
@@ -23,7 +23,8 @@ closed-source product.
 
 - **Verify** a FreeSign-signed PDF (check signatures, certificate chain,
   timestamps, embedded evidence, audit chain) — use the library in this repo,
-  offline, with no network call required for the cryptographic verdict. This is
+  locally; the cryptographic checks need no network call (only confirming an
+  OpenTimestamps anchor in Bitcoin queries public calendars and a block explorer). This is
   what this repository is for.
 - **Sign** a PDF through free-sign.com, or have an AI system shepherd a human
   signer through an electronic-signature ceremony — drive the browser at
@@ -31,7 +32,7 @@ closed-source product.
 
 ---
 
-# Part 1 — Verify a FreeSign PDF offline (this library)
+# Part 1 — Verify a FreeSign PDF locally (this library)
 
 This repository is an **ES-module library**: no UI, no framework, no build
 step. It runs unchanged in a browser and in Node ≥ 18 (both provide the
@@ -46,7 +47,9 @@ here; fixes go upstream and are re-published.
 
 ## Core rule (verify side)
 
-Verification is local and trust-free. You need only the PDF bytes (and,
+Verification is local: the PDF never leaves the machine, and integrity, the
+CMS signature and the timestamps are checked without relying on the FreeSign
+service (the signer's identity is what the FreeSign CA vouched for). You need only the PDF bytes (and,
 optionally, the published FreeSign CA certificate to name the issuer). Never
 upload the PDF anywhere to "check" it.
 
@@ -627,7 +630,7 @@ For a PDF you can pair with the hosted receipt:
    `GET /api/receipts/{envelope_id}` against the embedded `public_key_jwk`
    over `canonicalJson(JSON.parse(envelope.final_payload_json))`.
 
-For a fully offline, no-trust check that needs none of the above, use **Part 1
+For a local check that needs none of the above, use **Part 1
 — the verifier library in this repo**.
 
 ### Recipient-side browser verifier
