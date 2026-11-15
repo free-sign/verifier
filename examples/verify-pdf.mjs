@@ -8,14 +8,29 @@
 // btoa and AbortSignal.timeout are all global there. The PDF bytes never leave
 // this process; the only optional network calls are OpenTimestamps calendar /
 // blockstream.info lookups used to confirm the Bitcoin anchor for display.
+//
+// Optional CA pin: FREESIGN_TRUSTED_CAS_URL=https://free-sign.com/.well-known/free-sign-signing-cas.json
+// pins the certificate chain to the published list of FreeSign CAs (current +
+// archived after a CA rotation); a signature under an archived CA is reported
+// as such. Unset → no pin (chain is checked against the embedded CA only).
 
 import { readFileSync } from "node:fs";
-import { extractSignatures, verifySignature } from "../verify.js";
+import { extractSignatures, verifySignature, setTrustedFreeSignCas } from "../verify.js";
 
 const path = process.argv[2];
 if (!path) {
   console.error("usage: node examples/verify-pdf.mjs <signed.pdf>");
   process.exit(2);
+}
+
+if (process.env.FREESIGN_TRUSTED_CAS_URL) {
+  const res = await fetch(process.env.FREESIGN_TRUSTED_CAS_URL, { signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) {
+    console.error(`Could not load trusted CA list: HTTP ${res.status}`);
+    process.exit(2);
+  }
+  const { cas = [] } = await res.json();
+  setTrustedFreeSignCas(new Map(cas.map((ca) => [String(ca.sha256).toLowerCase(), ca.status === "archived" ? "archived" : "current"])));
 }
 
 const bytes = new Uint8Array(readFileSync(path));
@@ -96,7 +111,7 @@ for (let i = 0; i < sigs.length; i += 1) {
   if (c.pq) console.log(`  Post-quantum (ML-DSA)${mark(c.pq)}`);
   console.log(`  Signing time         ${r.summary.signingTime}`);
   console.log(`  Profile              ${r.summary.cmsProfile}`);
-  console.log(`  CA subject           ${r.summary.caSubject}`);
+  console.log(`  CA subject           ${r.summary.caSubject}${r.summary.caArchived ? " (archived FreeSign CA)" : ""}`);
   for (const [name, chk] of Object.entries(c)) {
     if (chk.state !== "ok" && chk.detail) console.log(`    ${name}: ${chk.detail}`);
   }

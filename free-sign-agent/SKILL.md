@@ -154,7 +154,7 @@ piece.
 |-------|---------------------|
 | **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — content unmodified since signing. |
 | **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
-| **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
+| **RFC 3161 timestamp** | An independent timestamp authority attests *when* the signature was made (PAdES-B-T signature-time-stamp). A PDF document timestamp (`eContentType` id-ct-TSTInfo) is verified separately: CMS signer digest over the encapsulated TSTInfo, `messageImprint` over the ByteRange. Profile `document timestamp`, or `PAdES-B-LTA document timestamp` when it covers an earlier signature. The TSA chain is cryptographically checked and, with no AATL/EUTL store, reported as not trust-anchored rather than a green attestation. |
 | **OpenTimestamps proofs** | Timestamps anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert vanish. A seal carries **two**, both reported under this one verdict: one over the signed document (`…65834.1.1`), committing to the signature's **ByteRange SHA-256** (`result.summary.byteRangeSha256`), **not** `SHA-256(signed.pdf)`; and one over the CMS SignedAttributes (`…65834.1.5`, surfaced as `checks.ots.signedAttrs`), which is what dates the post-quantum key commitment. |
 | **Embedded evidence record** | Consent text, identity method (OTP or passkey), canonical signed payload, and request fingerprint, embedded as a CMS **signed** attribute `1.3.6.1.4.1.65834.1.2` (FreeSign's PEN) — editing it invalidates the CMS signature, and a record found only in the *unsigned* set (pre-2026-06 seals, or appended by anyone) is ignored and reported as a non-fatal `warn` caveat — never trusted. |
 | **Post-quantum co-signature** | A second signature over the same SignedAttributes, made with ML-DSA (FIPS 204) and verified with `@noble/post-quantum`. Present only on seals made with the post-quantum option on. Its public key is committed to *inside* the signed attributes (`…65834.1.3`), so today's classical signature is what binds that key to the signer; the signature itself rides as unsignedAttribute `…65834.1.4`. |
@@ -477,7 +477,9 @@ browser session — refresh without ?envelope=… to start a new ceremony."
   `freesign_verified_seal`.
 - `POST /api/envelopes/{id}/finalize`: store the locally sealed PDF hash and a
   second ECDSA signature made with the same browser key as `/sign`. Idempotent
-  — returns 409 `already_finalized` on a repeat. Full request body:
+  — returns 409 `already_finalized` on a repeat; treat that as success and
+  retry the same body after a dropped response. A head mismatch means
+  re-fetch `GET /audit` and re-sign. Full request body:
 
 ```json
 {
@@ -502,8 +504,13 @@ keys return 400 `final_payload_unknown_fields`. `app` must equal
 (`YYYY-MM-DDThh:mm:ss[.fff]Z`). `audit_chain_head_hash` is the `event_hash` of
 the latest audit event for the envelope — fetch it from
 `GET /api/envelopes/{id}/audit` (last element of `events`) right before
-finalizing; the server re-derives the current chain head and rejects on
-mismatch, freezing the audit chain in signed evidence (security audit G-01).
+finalizing. The server accepts that hash when it is still the tail, or when
+the only events after it are asynchronous OpenTimestamps anchor events. Any
+other mismatch is 400 `final_payload_audit_chain_head_mismatch` — fetch the
+head again and re-sign. The attested head freezes the audit chain in signed
+evidence (security audit G-01). A validated attempt is replayed by the
+finalize_retry cron if the envelope update did not commit. A receipt read
+does not replay it. The server never invents the PDF hash.
 - `GET /api/verify?document_sha256=<hash>`: find matching receipts.
 - `GET /api/receipts/{id}`: fetch evidence — `{envelope, receipts, ots_anchors}`.
   The envelope object includes `final_pdf_sha256`, `final_signature_base64url`,

@@ -124,7 +124,7 @@ For **each signature** in the PDF:
 |-------|---------------------|
 | **CMS signature** (PKCS#7, RFC 5652) | The signed byte range hashes to exactly what the signer's key signed — content unmodified since signing. |
 | **Certificate chain** | The per-signer X.509 leaf certificate chains to the FreeSign signing CA; Subject CN = typed name, SAN = OTP-verified e-mail. |
-| **RFC 3161 timestamp** | An independent DigiCert timestamp authority attests *when* the signature was made (PAdES-B-T). |
+| **RFC 3161 timestamp** | An independent timestamp authority attests *when* the signature was made (PAdES-B-T signature-time-stamp). A PDF document timestamp (`eContentType` id-ct-TSTInfo) is verified as its own token: the CMS signer digest covers the encapsulated TSTInfo, and `TSTInfo.messageImprint` covers the ByteRange. The profile is `document timestamp`, or `PAdES-B-LTA document timestamp` when that ByteRange covers an earlier signature. The TSA certificate must have a critical `id-kp-timeStamping`-only extended key usage. Its chain is checked cryptographically and is not pinned to the FreeSign CA. With no AATL/EUTL store loaded, that chain is a warning (cryptographically valid, TSA not trust-anchored), not a green third-party attestation. |
 | **OpenTimestamps proofs** | Independent timestamps anchored into the Bitcoin blockchain — datable even if FreeSign and DigiCert both vanish. A FreeSign seal carries two, both reported under this one verdict: one over the signed document (`…65834.1.1`) and one over the CMS SignedAttributes (`…65834.1.5`, surfaced as `checks.ots.signedAttrs`) — the latter is what dates the post-quantum key commitment. When an embedded proof is still calendar-only, the verifier queries public OTS calendars for the Bitcoin upgrade before reporting. |
 | **Embedded evidence record** | The consent text, identity method (OTP or passkey), canonical signed payload and request fingerprint FreeSign embedded inside the signature (CMS **signed** attribute `1.3.6.1.4.1.65834.1.2`, under FreeSign's PEN — editing it invalidates the CMS signature; a record found only in the unsigned set — where seals made before 2026-06 carried it — is ignored and reported as a ⚠ caveat, never trusted). |
 | **Post-quantum co-signature** | A second signature over the same signed attributes, made with ML-DSA (FIPS 204). Present only on documents sealed with the post-quantum option on; its public key is committed to *inside* the signed attributes, so the classical signature is what binds it to the signer. Verified with [`@noble/post-quantum`](https://github.com/paulmillr/noble-post-quantum) — the one check that needs `npm install`; every other check runs on Node built-ins. |
@@ -205,6 +205,16 @@ FreeSign CA certificate:
 - PEM: <https://free-sign.com/.well-known/free-sign-signing-ca.pem>
 - SHA-256: <https://free-sign.com/.well-known/free-sign-signing-ca.sha256.txt>
 
+After a CA rotation, documents signed under an earlier (archived) FreeSign CA
+stay verifiable. Every trusted CA — current and archived — is published:
+
+- List: <https://free-sign.com/.well-known/free-sign-signing-cas.json> (also
+  `free-sign-signing-cas.sha256.txt`, one fingerprint per line, current first)
+- Per CA: `https://free-sign.com/.well-known/free-sign-signing-ca/<sha256>.pem` and `.crl`
+
+`FREESIGN_TRUSTED_CAS_URL=<list URL> node examples/verify-pdf.mjs <pdf>` pins
+the chain to that list and labels signatures under an archived CA.
+
 ---
 
 ## Reporting a problem
@@ -219,7 +229,7 @@ invalid when it is — that is a security bug. Please report it.
 
 ## License
 
-[MIT](./LICENSE) © 2026 2Dynamic Games sp. z o.o. (Coder AI), Kraków, Poland.
+[MIT](./LICENSE) © 2026 Coder AI.
 
 The hosted FreeSign service is a separate, proprietary product. This license
 covers the verifier code in this repository.

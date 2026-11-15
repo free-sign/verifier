@@ -34,6 +34,15 @@ const OID = {
   signingCertificate: "1.2.840.113549.1.9.16.2.12",       // ESS v1 (SHA-1)
   signingCertificateV2: "1.2.840.113549.1.9.16.2.47",     // ESS v2 (SHA-256+)
   signatureTimeStampToken: "1.2.840.113549.1.9.16.2.14",
+  // id-ct-TSTInfo — eContentType of an RFC 3161 TimeStampToken. A PDF
+  // document timestamp (/Type /DocTimeStamp, /SubFilter /ETSI.RFC3161) is
+  // this token directly: messageDigest covers the TSTInfo, and the document
+  // hash is TSTInfo.messageImprint, not the ByteRange.
+  idCtTstInfo: "1.2.840.113549.1.9.16.1.4",
+  // RFC 5280 extendedKeyUsage / RFC 3161 id-kp-timeStamping. A TSA certificate
+  // must carry this purpose alone, and the extension must be critical.
+  extendedKeyUsage: "2.5.29.37",
+  idKpTimeStamping: "1.3.6.1.5.5.7.3.8",
   // Digests.
   sha1: "1.3.14.3.2.26",
   sha256: "2.16.840.1.101.3.4.2.1",
@@ -457,7 +466,7 @@ function decodeInteger(buf, start, end) {
   return n;
 }
 
-function decodeTime(buf, tlv) {
+export function decodeTime(buf, tlv) {
   const s = new TextDecoder().decode(buf.slice(tlv.start, tlv.end));
   if (tlv.tag === 0x17) {
     // UTCTime YYMMDDHHMMSSZ
@@ -468,10 +477,14 @@ function decodeTime(buf, tlv) {
     return new Date(Date.UTC(year, +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
   }
   if (tlv.tag === 0x18) {
-    // GeneralizedTime YYYYMMDDHHMMSSZ
-    const m = s.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/);
+    // GeneralizedTime YYYYMMDDHHMMSS[.fraction]Z. RFC 3161 genTime is
+    // GeneralizedTime and X.690 allows a fractional-seconds element (the
+    // separator is "." in DER; "," shows up in some BER encoders).
+    const m = s.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:[.,](\d+))?Z$/);
     if (!m) throw new Error("invalid GeneralizedTime " + s);
-    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+    const fraction = m[7] ? Number("0." + m[7]) : 0;
+    const ms = Number.isFinite(fraction) ? Math.round(fraction * 1000) : 0;
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], ms));
   }
   throw new Error("not a time tag 0x" + tlv.tag.toString(16));
 }
@@ -496,6 +509,31 @@ function childrenOf(buf, tlv) {
 // -----------------------------------------------------------------------------
 // X.509 certificate parser — extracts what we need for verification + display.
 // -----------------------------------------------------------------------------
+
+// Extension ::= SEQUENCE { extnID, critical BOOLEAN DEFAULT FALSE, extnValue }
+function extensionIsCritical(buf, extKids) {
+  for (const kid of extKids) {
+    if (kid.tag === 0x01) return buf[kid.start] !== 0x00;
+  }
+  return false;
+}
+
+// RFC 3161 §2.3: the TSA certificate's extendedKeyUsage contains only
+// id-kp-timeStamping and the extension is critical. Anything else means this
+// certificate is not a time-stamping certificate.
+function assertTsaTimeStampingEku(cert) {
+  const eku = cert && cert.extendedKeyUsage;
+  if (!eku || eku.duplicate) {
+    throw new Error("TSA certificate must contain exactly one extendedKeyUsage extension with id-kp-timeStamping (RFC 3161 §2.3)");
+  }
+  if (!eku.critical) {
+    throw new Error("TSA certificate extendedKeyUsage must be critical (RFC 3161 §2.3)");
+  }
+  const onlyTimeStamping = eku.purposes.length === 1 && eku.purposes[0] === OID.idKpTimeStamping;
+  if (!onlyTimeStamping) {
+    throw new Error("TSA certificate extendedKeyUsage must contain only id-kp-timeStamping (1.3.6.1.5.5.7.3.8) (RFC 3161 §2.3)");
+  }
+}
 
 function parseCertificate(certDer) {
   const top = readTlv(certDer, 0);
@@ -562,6 +600,7 @@ function parseCertificate(certDer) {
   let ski = null;
   let basicConstraintsCa = false;
   let keyUsageKeyCertSign = false;
+  let extendedKeyUsage = null;
   while (cursor < tbs.end) {
     const t = readTlv(certDer, cursor);
     if (t.tag === 0xa3) {
@@ -599,6 +638,23 @@ function parseCertificate(certDer) {
               if (k.tag === 0x01) basicConstraintsCa = certDer[k.start] === 0xff;
             }
           }
+        } else if (extOid === OID.extendedKeyUsage) {
+          // ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId.
+          // RFC 3161 §2.3: a TSA cert has exactly one of these extensions,
+          // it is critical, and its only purpose is id-kp-timeStamping.
+          const critical = extensionIsCritical(certDer, extKids);
+          const inner = readTlv(certDer, valTlv.start);
+          const purposes = [];
+          if (inner.tag === 0x30) {
+            for (const purpose of childrenOf(certDer, inner)) {
+              if (purpose.tag === 0x06) purposes.push(decodeOid(certDer, purpose.start, purpose.end));
+            }
+          }
+          if (extendedKeyUsage) {
+            extendedKeyUsage = { critical, purposes, duplicate: true };
+          } else {
+            extendedKeyUsage = { critical, purposes, duplicate: false };
+          }
         } else if (extOid === "2.5.29.15") {
           // keyUsage ::= BIT STRING. extnValue is OCTET STRING wrapping BIT STRING.
           // Bit assignments (RFC 5280 §4.2.1.3, big-endian):
@@ -633,6 +689,7 @@ function parseCertificate(certDer) {
     ski,
     basicConstraintsCa,
     keyUsageKeyCertSign,
+    extendedKeyUsage,
     // Bytes + algorithm needed to verify the cert's own signature against an
     // issuer's public key (used by verifyCertSignature in the chain check).
     tbsBytes,
@@ -1480,6 +1537,8 @@ function extractSignatures(pdfBytes) {
     const signed = new Uint8Array(len1 + len2);
     signed.set(pdfBytes.slice(a0, a0 + len1), 0);
     signed.set(pdfBytes.slice(off2, off2 + len2), len1);
+    const located = locateSignatureDictionary(text, m.index, span.hexStart);
+    const sigDictText = located.text;
     found.push({
       byteRange: { a: a0, len1, off2, len2 },
       pdfLength: pdfBytes.length,
@@ -1489,7 +1548,11 @@ function extractSignatures(pdfBytes) {
       signedRegion: signed,
       bracketStart: span.ltIdx,
       bracketEnd: span.gtIdx,
-      sigDictText: extractSigDictText(text, m.index),
+      sigDictText,
+      dictUnparsed: sigDictText.length === 0,
+      // Used only when no validated dictionary owns this signature. Names
+      // inside literal strings, hex strings, and comments do not count.
+      rawDocTimestampClaim: sigDictText.length === 0 && located.claim,
     });
   }
   for (const sig of found) {
@@ -1505,6 +1568,17 @@ function extractSignatures(pdfBytes) {
     const trailingAppend = sig.byteRangeEnd !== pdfBytes.length && !hasLaterSignedRevision;
     sig.hasUnsignedAppend = trailingAppend
       && !isBenignDssAppend(text, sig.byteRangeEnd);
+  }
+  // PAdES-B-LTA is a document timestamp whose ByteRange covers an earlier
+  // signature that itself extracted (valid /ByteRange + /Contents). Deciding
+  // this from raw "/Type /Sig" text would treat a mention of those words in
+  // page content as an archival timestamp.
+  for (const sig of found) {
+    sig.coversPriorSignature = found.some((other) =>
+      other !== sig
+      && other.byteRangeEnd <= sig.byteRangeEnd
+      && byteRangeCoversInterval(sig.byteRange, other.byteRange.a, other.byteRangeEnd)
+    );
   }
   return found;
 }
@@ -1576,53 +1650,367 @@ function readContentsHex(text, contentsIdx) {
   return { ltIdx, gtIdx, hexStart: ltIdx + 1, hexEnd: gtIdx };
 }
 
-function extractSigDictText(text, byteRangeIdx) {
-  // Walk backward looking for the OUTER signature dict's `<<`, tracking depth
-  // so nested sub-dicts (`/Prop_Build <<...>>`, `/Reference <<...>>`) before
-  // /ByteRange don't confuse us (issue #16 from /cr). Then walk forward to
-  // find the matching `>>` at the same depth (issue #28 — larger window).
-  // Display-only — never trusted for verification.
-  // Issue #28: 32 KB was too small for real-world /Sig dicts with large
-  // /Reference arrays or signed-attribute metadata. Raise to 128 KB back /
-  // 256 KB forward — still bounded so we don't scan the whole 200 MB cap
-  // for what's actually a display-only nice-to-have.
-  const BACK = 131072;
-  const FWD = 262144;
+// ISO 32000 whitespace: NUL, TAB, LF, FF, CR, SPACE. `<<` is a delimiter, so
+// `6 0 obj<<` is a real object header.
+const PDF_WS_RE = /[\0\t\n\f\r ]/;
+
+function locateSignatureDictionary(text, byteRangeIdx, contentsHexStart) {
+  // One backward lexer from the /ByteRange token finds the dictionary that
+  // encloses it. Literal strings, hex strings, and comments are skipped, so
+  // an `N G obj <<` inside /Reason is never a candidate and cannot evict the
+  // real object. The same forward lexer then reads that dictionary. If its
+  // close is past the walk limit, direct /Type /DocTimeStamp and
+  // /SubFilter /ETSI.RFC3161 already seen on that dictionary still count.
+  let cursor = byteRangeIdx;
+  while (cursor > 0) {
+    const open = findEnclosingDictOpen(text, cursor);
+    if (open < 0) break;
+    const walked = innermostDictWithDirectKeys(text, open, byteRangeIdx, null);
+    if (walked.dict) {
+      return { text: text.slice(walked.dict.open, walked.dict.close), claim: false };
+    }
+    if (walked.claim) return { text: "", claim: true };
+    cursor = open;
+  }
+  const objAt = findObjKeywordBackward(text, byteRangeIdx);
+  return {
+    text: "",
+    claim: objAt >= 0 && regionClaimsDocumentTimestamp(text, objAt, contentsHexStart),
+  };
+}
+
+// Walk backward from `fromIdx` to the `<<` of the dictionary that contains
+// that index. Nested dictionaries are matched. Strings and comments are
+// opaque, so a `<<` inside them does not change depth.
+function findEnclosingDictOpen(text, fromIdx) {
   let depth = 0;
-  let openIdx = -1;
-  for (let i = byteRangeIdx; i >= 1 && i > byteRangeIdx - BACK; i -= 1) {
-    if (text[i - 1] === ">" && text[i] === ">") depth += 1;
-    else if (text[i - 1] === "<" && text[i] === "<") {
-      if (depth === 0) { openIdx = i - 1; break; }
+  let i = fromIdx - 1;
+  while (i >= 0) {
+    const lineBreak = Math.max(text.lastIndexOf("\n", i), text.lastIndexOf("\r", i));
+    const lineStart = lineBreak < 0 ? 0 : lineBreak + 1;
+    const pct = text.indexOf("%", lineStart);
+    // A ")" between "%" and here is a string ending, not a comment. Comments
+    // in these dictionaries do not rely on a paren to be recognized: the "%"
+    // is the closest marker on the line.
+    if (pct !== -1 && pct <= i && !text.slice(pct, i + 1).includes(")")) {
+      i = pct - 1;
+      continue;
+    }
+    const ch = text[i];
+    if (ch === ")") {
+      i = skipLiteralBackward(text, i);
+      continue;
+    }
+    if (ch === ">" && i > 0 && text[i - 1] === ">") {
+      depth += 1;
+      i -= 2;
+      continue;
+    }
+    if (ch === ">") {
+      let j = i - 1;
+      while (j >= 0 && text[j] !== "<") j -= 1;
+      if (j < 0) return -1;
+      i = j - 1;
+      continue;
+    }
+    if (ch === "<" && i > 0 && text[i - 1] === "<") {
+      if (depth === 0) return i - 1;
       depth -= 1;
+      i -= 2;
+      continue;
     }
+    i -= 1;
   }
-  if (openIdx < 0) return "";
-  let fwdDepth = 0;
-  let closeIdx = -1;
-  for (let i = byteRangeIdx; i < text.length - 1 && i < byteRangeIdx + FWD; i += 1) {
-    if (text[i] === "<" && text[i + 1] === "<") { fwdDepth += 1; i += 1; continue; }
-    if (text[i] === ">" && text[i + 1] === ">") {
-      if (fwdDepth === 0) { closeIdx = i + 2; break; }
-      fwdDepth -= 1;
+  return -1;
+}
+
+function skipLiteralBackward(text, closeIdx) {
+  let depth = 1;
+  let j = closeIdx - 1;
+  while (j >= 0 && depth > 0) {
+    const ch = text[j];
+    if (ch === "(" || ch === ")") {
+      let slashes = 0;
+      for (let k = j - 1; k >= 0 && text[k] === "\\"; k -= 1) slashes += 1;
+      if (slashes % 2 === 0) {
+        if (ch === ")") depth += 1;
+        else depth -= 1;
+      }
+    }
+    j -= 1;
+  }
+  return j;
+}
+
+function findObjKeywordBackward(text, fromIdx) {
+  let i = fromIdx - 1;
+  while (i >= 2) {
+    const lineBreak = Math.max(text.lastIndexOf("\n", i), text.lastIndexOf("\r", i));
+    const lineStart = lineBreak < 0 ? 0 : lineBreak + 1;
+    const pct = text.indexOf("%", lineStart);
+    if (pct !== -1 && pct <= i && !text.slice(pct, i + 1).includes(")")) {
+      i = pct - 1;
+      continue;
+    }
+    if (text[i] === ")") {
+      i = skipLiteralBackward(text, i);
+      continue;
+    }
+    if (text.slice(i - 2, i + 1) === "obj" && objKeywordAt(text, i - 2)) return i - 2;
+    i -= 1;
+  }
+  return -1;
+}
+
+function objKeywordAt(text, at) {
+  if (text.slice(at, at + 3) !== "obj") return false;
+  const prev = at === 0 ? "" : text[at - 1];
+  if (prev && !PDF_WS_RE.test(prev)) return false;
+  const next = text[at + 3] || "";
+  return next === "" || PDF_WS_RE.test(next) || "()<>[]{}/%".includes(next);
+}
+
+// Names outside literal strings, hex strings, and comments. `<<` / `>>` are
+// dictionary delimiters, not the start of a hex string.
+function regionClaimsDocumentTimestamp(text, start, end) {
+  let i = start;
+  while (i < end) {
+    const ch = text[i];
+    if (PDF_WS_RE.test(ch)) { i += 1; continue; }
+    if (ch === "%") { i = skipPdfComment(text, i); continue; }
+    if (ch === "(") { i = skipPdfLiteralString(text, i); continue; }
+    if (ch === "<" && text[i + 1] === "<") { i += 2; continue; }
+    if (ch === ">" && text[i + 1] === ">") { i += 2; continue; }
+    if (ch === "<") {
+      const gt = text.indexOf(">", i + 1);
+      i = gt === -1 || gt + 1 > end ? end : gt + 1;
+      continue;
+    }
+    if (ch === "/") {
+      const name = readPdfName(text, i);
+      if (name.text === "DocTimeStamp" || name.text === "ETSI.RFC3161") return true;
+      i = name.end;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+
+// Walk PDF syntax starting at a dictionary open. Direct keys are names read
+// in key position at that dictionary's own depth — nested dictionaries,
+// arrays, strings, hex strings and comments do not contribute keys.
+// `<<` is always a dictionary open, never a hex string. If the close is past
+// the walk limit, `claim` is true when this dictionary already showed a
+// direct /Type /DocTimeStamp or /SubFilter /ETSI.RFC3161.
+function innermostDictWithDirectKeys(text, start, byteRangeIdx, spans) {
+  const stack = [];
+  const limit = Math.min(text.length, byteRangeIdx + 2 * 1024 * 1024);
+  let i = start;
+  while (i < limit - 1) {
+    const ch = text[i];
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\0") { i += 1; continue; }
+    if (ch === "%") {
+      const end = skipPdfComment(text, i);
+      if (spans) spans.push([i, end]);
+      i = end;
+      continue;
+    }
+    if (ch === "(") {
+      const end = skipPdfLiteralString(text, i);
+      if (spans) spans.push([i, end]);
+      i = end;
+      finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "<" && text[i + 1] === "<") {
+      stack.push({ open: i, keys: new Set(), expect: "key", arrayDepth: 0, pending: null, docTs: false });
+      i += 2;
+      continue;
+    }
+    if (ch === ">" && text[i + 1] === ">") {
+      const frame = stack.pop();
+      const close = i + 2;
+      if (frame
+        && frame.keys.has("ByteRange")
+        && frame.keys.has("Contents")
+        && frame.open <= byteRangeIdx
+        && byteRangeIdx < close) {
+        return { dict: { open: frame.open, close }, claim: false };
+      }
+      i = close;
+      finishDirectValue(stack);
+      if (stack.length === 0) break;
+      continue;
+    }
+    if (ch === "<") {
+      const gt = text.indexOf(">", i + 1);
+      const end = gt === -1 ? text.length : gt + 1;
+      if (spans) spans.push([i, end]);
+      i = end;
+      finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "[") {
+      const top = stack[stack.length - 1];
+      if (top) top.arrayDepth += 1;
       i += 1;
+      continue;
+    }
+    if (ch === "]") {
+      const top = stack[stack.length - 1];
+      if (top && top.arrayDepth > 0) top.arrayDepth -= 1;
+      i += 1;
+      if (top && top.arrayDepth === 0) finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "/") {
+      const name = readPdfName(text, i);
+      const top = stack[stack.length - 1];
+      i = name.end;
+      if (top && top.arrayDepth === 0 && top.expect === "key") {
+        top.pending = name.text;
+        top.keys.add(name.text);
+        top.expect = "value";
+      } else {
+        if (top && top.arrayDepth === 0 && top.expect === "value") {
+          if ((top.pending === "Type" && name.text === "DocTimeStamp")
+            || (top.pending === "SubFilter" && name.text === "ETSI.RFC3161")) {
+            top.docTs = true;
+          }
+        }
+        finishDirectValue(stack);
+      }
+      continue;
+    }
+    const atomStart = i;
+    while (i < text.length && /[^\s/<>[\]()%]/.test(text[i])) i += 1;
+    if (i === atomStart) i += 1;
+    finishDirectValue(stack);
+  }
+  let claim = false;
+  for (let s = stack.length - 1; s >= 0; s -= 1) {
+    const frame = stack[s];
+    if (frame.open <= byteRangeIdx && frame.docTs && frame.keys.has("ByteRange") && frame.keys.has("Contents")) {
+      claim = true;
+      break;
     }
   }
-  if (closeIdx < 0) return "";
-  return text.slice(openIdx, closeIdx);
+  return { dict: null, claim };
+}
+
+function finishDirectValue(stack) {
+  const top = stack[stack.length - 1];
+  if (!top || top.arrayDepth > 0 || top.expect !== "value") return;
+  top.expect = "key";
+}
+
+function readPdfName(text, slashIdx) {
+  const m = /^[^\s/<>[\]()%]+/.exec(text.slice(slashIdx + 1));
+  const raw = m ? m[0] : "";
+  return { text: raw, end: slashIdx + 1 + raw.length };
+}
+
+// Direct keys of the outermost dictionary in `dictText`. Nested dicts are
+// values, not additional keys. `onKey(name, valueIdx)` may return true to stop.
+function forEachDirectKey(dictText, onKey) {
+  const stack = [];
+  let i = 0;
+  while (i < dictText.length) {
+    const ch = dictText[i];
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f") { i += 1; continue; }
+    if (ch === "%") { i = skipPdfComment(dictText, i); continue; }
+    if (ch === "(") {
+      const top = stack[stack.length - 1];
+      if (stack.length === 1 && top && top.expect === "value" && top.arrayDepth === 0 && top.pending) {
+        if (onKey(top.pending, i)) return;
+        top.pending = null;
+      }
+      i = skipPdfLiteralString(dictText, i);
+      finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "<" && dictText[i + 1] === "<") {
+      stack.push({ expect: "key", arrayDepth: 0, pending: null });
+      i += 2;
+      continue;
+    }
+    if (ch === ">" && dictText[i + 1] === ">") {
+      stack.pop();
+      i += 2;
+      finishDirectValue(stack);
+      if (stack.length === 0) return;
+      continue;
+    }
+    if (ch === "<") {
+      const top = stack[stack.length - 1];
+      if (stack.length === 1 && top && top.expect === "value" && top.arrayDepth === 0 && top.pending) {
+        if (onKey(top.pending, i)) return;
+        top.pending = null;
+      }
+      const gt = dictText.indexOf(">", i + 1);
+      i = gt === -1 ? dictText.length : gt + 1;
+      finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "[") {
+      const top = stack[stack.length - 1];
+      if (top) top.arrayDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "]") {
+      const top = stack[stack.length - 1];
+      if (top && top.arrayDepth > 0) top.arrayDepth -= 1;
+      i += 1;
+      if (top && top.arrayDepth === 0) finishDirectValue(stack);
+      continue;
+    }
+    if (ch === "/") {
+      const name = readPdfName(dictText, i);
+      const top = stack[stack.length - 1];
+      if (top && top.arrayDepth === 0 && top.expect === "value" && top.pending) {
+        if (stack.length === 1 && onKey(top.pending, i)) return;
+        top.pending = null;
+        top.expect = "key";
+        i = name.end;
+        continue;
+      }
+      i = name.end;
+      if (top && top.arrayDepth === 0 && top.expect === "key") {
+        top.pending = name.text;
+        top.expect = "value";
+      }
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (stack.length === 1 && top && top.expect === "value" && top.arrayDepth === 0 && top.pending) {
+      if (onKey(top.pending, i)) return;
+      top.pending = null;
+    }
+    const atomStart = i;
+    while (i < dictText.length && /[^\s/<>[\]()%]/.test(dictText[i])) i += 1;
+    if (i === atomStart) i += 1;
+    finishDirectValue(stack);
+  }
 }
 
 function parseSigDictField(dictText, key) {
-  // Parse a /Key (literal string) entry. PDF literal strings allow balanced
-  // parens, octal escapes (\nnn), and line continuations (\\<newline>).
-  // Issue #32 from /cr: previous regex only handled \), \(, \\. Now handles
-  // octal escapes and balanced parens.
-  const keyMarker = "/" + key;
-  let i = dictText.indexOf(keyMarker);
-  while (i !== -1) {
-    let j = i + keyMarker.length;
-    while (j < dictText.length && /\s/.test(dictText[j])) j += 1;
-    if (dictText[j] !== "(") { i = dictText.indexOf(keyMarker, i + 1); continue; }
+  // Parse a direct /Key (literal string) entry. Nested dictionaries do not
+  // contribute. PDF literal strings allow balanced parens, octal escapes
+  // (\nnn), and line continuations (\\<newline>).
+  let i = -1;
+  forEachDirectKey(dictText, (name, valueIdx) => {
+    if (name === key && dictText[valueIdx] === "(") {
+      i = valueIdx;
+      return true;
+    }
+    return false;
+  });
+  if (i < 0) return null;
+  {
+    let j = i;
     // Walk through balanced parens, respecting escapes.
     let depth = 1;
     let out = "";
@@ -1663,22 +2051,61 @@ function parseSigDictField(dictText, key) {
   return null;
 }
 
+// Advance past a PDF comment starting at "%". EOL is CR, LF, or CRLF
+// (ISO 32000); stopping only at LF leaves a CR-terminated comment covering
+// the next dictionary keys.
+function skipPdfComment(text, percentIdx) {
+  let j = percentIdx + 1;
+  while (j < text.length && text[j] !== "\n" && text[j] !== "\r") j += 1;
+  if (text[j] === "\r" && text[j + 1] === "\n") return j + 2;
+  return j < text.length ? j + 1 : j;
+}
+
+// Advance past a PDF literal string starting at the opening "(". Handles
+// balanced parentheses and the escapes parseSigDictField understands, so a
+// name search never treats "/Type /DocTimeStamp" inside /Reason (...) as a key.
+function skipPdfLiteralString(text, openIdx) {
+  let depth = 1;
+  let j = openIdx + 1;
+  while (j < text.length && depth > 0) {
+    const ch = text[j];
+    if (ch === "\\") {
+      const next = text[j + 1];
+      if (/[0-7]/.test(next || "")) {
+        let k = 0;
+        while (k < 3 && /[0-7]/.test(text[j + 1 + k] || "")) k += 1;
+        j += 1 + k;
+      } else {
+        j += 2;
+      }
+    } else if (ch === "(") {
+      depth += 1;
+      j += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      j += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return j;
+}
+
 // Parse a /Key entry whose value is a PDF name (e.g. /SubFilter /adbe.pkcs7.detached).
 // Names run until whitespace or a delimiter; we don't decode #xx escapes since the
-// names we care about (SubFilter values) never contain them.
+// names we care about (SubFilter values) never contain them. Literal strings and
+// hex strings are skipped, so a /Reason that mentions /Type /DocTimeStamp cannot
+// be read as the dictionary's own /Type.
 function parseSigDictName(dictText, key) {
-  const keyMarker = "/" + key;
-  let i = dictText.indexOf(keyMarker);
-  while (i !== -1) {
-    let j = i + keyMarker.length;
-    while (j < dictText.length && /\s/.test(dictText[j])) j += 1;
-    if (dictText[j] === "/") {
-      const m = /^[^\s/<>[\]()]+/.exec(dictText.slice(j + 1));
-      if (m) return m[0];
-    }
-    i = dictText.indexOf(keyMarker, i + 1);
-  }
-  return null;
+  // Only a direct key of this dictionary. A nested `/Custom << /Type /DocTimeStamp >>`
+  // must not supply /Type or /SubFilter for the signature that encloses it.
+  let found = null;
+  forEachDirectKey(dictText, (name, valueIdx) => {
+    if (name !== key || dictText[valueIdx] !== "/") return false;
+    found = readPdfName(dictText, valueIdx).text;
+    return true;
+  });
+  return found;
 }
 
 function trimTrailingZeros(bytes) {
@@ -1704,6 +2131,84 @@ function trimTrailingZeros(bytes) {
 // Verification pipeline.
 // -----------------------------------------------------------------------------
 
+// Test / embedding override: a Map(sha256hex -> "current"|"archived") of
+// trusted FreeSign CAs, or null to restore the default (fetch in browser,
+// no pin in Node).
+let trustedFreeSignCasOverride;
+function setTrustedFreeSignCas(map) {
+  trustedFreeSignCasOverride = map === null ? undefined : map;
+}
+
+// Returns Map(sha256hex -> "current"|"archived") of the FreeSign CAs this
+// deployment trusts (current + archived after a CA rotation), or null when
+// no pin applies.
+async function fetchTrustedFreeSignCas() {
+  if (trustedFreeSignCasOverride !== undefined) return trustedFreeSignCasOverride;
+  // Browser /verify runs on the same origin that serves the deployment's
+  // FreeSign CA list. Node-based unit tests import this module without
+  // a browser location; keep those deterministic and skip the live pin there.
+  if (typeof window === "undefined" || typeof fetch !== "function") return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch("/.well-known/free-sign-signing-cas.json", {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    const map = new Map();
+    for (const ca of (body && Array.isArray(body.cas) ? body.cas : [])) {
+      const fp = String(ca && ca.sha256 || "").toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(fp)) continue;
+      map.set(fp, ca.status === "archived" ? "archived" : "current");
+    }
+    if (!map.size) throw new Error("malformed fingerprint response");
+    return map;
+  } catch (e) {
+    throw new Error("could not load pinned FreeSign CA fingerprint: " + e.message);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// A PDF document timestamp (ETSI EN 319 142-1, the PAdES-B-LTA archival
+// layer) stores an RFC 3161 TimeStampToken in /Contents. That token is not a
+// detached CAdES signature: signedAttrs.messageDigest is the digest of the
+// encapsulated TSTInfo, and the ByteRange digest is TSTInfo.messageImprint.
+// The CMS eContentType has to be id-ct-TSTInfo. /Type /DocTimeStamp or
+// /SubFilter /ETSI.RFC3161 alone is not enough: an id-data payload that
+// merely looks like TSTInfo is a different object, and a dictionary that
+// claims a document timestamp while carrying that payload fails closed.
+const DOC_TS_CONTENT_MISMATCH = "signature dictionary claims a document timestamp (/Type /DocTimeStamp or /SubFilter /ETSI.RFC3161) but encapContentInfo.eContentType is not id-ct-TSTInfo (1.2.840.113549.1.9.16.1.4)";
+
+function dictionaryClaimsDocumentTimestamp(sig) {
+  const dict = sig.sigDictText || "";
+  // A validated dictionary is the only source of /Type and /SubFilter.
+  // Text that merely appears in one of its strings is not a claim.
+  if (dict) {
+    return parseSigDictName(dict, "SubFilter") === "ETSI.RFC3161"
+      || parseSigDictName(dict, "Type") === "DocTimeStamp";
+  }
+  return !!sig.rawDocTimestampClaim;
+}
+
+function isPdfDocumentTimestamp(cms) {
+  return !!(cms && cms.encapContentTypeOid === OID.idCtTstInfo);
+}
+
+// True when [start, end) lies entirely inside a signature ByteRange and does
+// not overlap that signature's /Contents hole.
+function byteRangeCoversInterval(byteRange, start, end) {
+  if (end < start) return false;
+  const holeStart = byteRange.a + byteRange.len1;
+  const holeEnd = byteRange.off2;
+  const coverEnd = byteRange.off2 + byteRange.len2;
+  if (start < byteRange.a || end > coverEnd) return false;
+  if (end <= holeStart || start >= holeEnd) return true;
+  return false;
+}
+
 // `opts.skipOtsCalendarUpgrade` suppresses the live OpenTimestamps calendar
 // lookups both anchor checks would otherwise make. The signing ceremony's own
 // post-seal self-check passes it: that path gates only on `cms` and `chain`,
@@ -1714,6 +2219,8 @@ function trimTrailingZeros(bytes) {
 async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
   const cms = parseCms(sig.cmsDer);
   const si = cms.signerInfo;
+  const isDocTs = isPdfDocumentTimestamp(cms);
+  const docTsMismatch = !isDocTs && dictionaryClaimsDocumentTimestamp(sig);
 
   // ---- Locate the leaf cert. Three matching strategies, in order:
   //   (1) sid=IssuerAndSerialNumber → byte-match issuerDer + serial
@@ -1756,15 +2263,27 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
   // Parse the TST genTime EARLY so the chain check (below) can prefer it over
   // the signer-claimed signingTime when deciding "was the cert valid at
   // signing time?". Full TST CMS verification (issue #2) runs as Check 3.
+  // A document timestamp IS the TimeStampToken, so its genTime comes from the
+  // outer CMS eContent rather than from a signature-time-stamp unsignedAttr.
   let tstSignedAt = null;
   let tstInfoEarly = null;
-  const tstAttrEarly = findAttr(si.unsignedAttrs, OID.signatureTimeStampToken);
-  if (tstAttrEarly) {
+  let tstAttrEarly = null;
+  if (isDocTs) {
     try {
-      tstInfoEarly = extractTstInfo(tstAttrEarly.valueRawWithHeader);
+      tstInfoEarly = extractTstInfo(sig.cmsDer);
       tstSignedAt = tstInfoEarly.genTime;
     } catch {
       // leave tstSignedAt null; the TST check below will report the parse error
+    }
+  } else {
+    tstAttrEarly = findAttr(si.unsignedAttrs, OID.signatureTimeStampToken);
+    if (tstAttrEarly) {
+      try {
+        tstInfoEarly = extractTstInfo(tstAttrEarly.valueRawWithHeader);
+        tstSignedAt = tstInfoEarly.genTime;
+      } catch {
+        // leave tstSignedAt null; the TST check below will report the parse error
+      }
     }
   }
   const signingTimeAttr = findAttr(si.signedAttrs, OID.signingTimeAttr);
@@ -1782,7 +2301,11 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
   let cmsDetail = "";
   let verifyParams = null;
   let spkiInfo = null;
+  // SignerInfo.digestAlgorithm and the digest it actually produced. Kept
+  // apart from TSTInfo.messageImprint, which names its own hash.
+  let signerDigest = null;
   try {
+    if (docTsMismatch) throw new Error(DOC_TS_CONTENT_MISMATCH);
     if (sig.byteRange?.a !== 0) {
       throw new Error("ByteRange starts after offset 0 — unsigned leading PDF bytes could affect the displayed document");
     }
@@ -1850,18 +2373,35 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
       ok = await rsaPkcs1V15LooseVerify(leaf.spkiDer, si.signatureBytes, si.signedAttrsAsHashed, verifyParams.hashName);
     }
     if (!ok) throw new Error(`${verifyParams.kind} signature verification failed`);
-    // Cross-check messageDigest == digest(signedRegion). For RSA / ECDSA the
-    // digest comes from SignerInfo.digestAlgorithm; for RSA-PSS we use the
-    // PSS hash; for Ed25519/Ed448 (no digest dispatch) we still check the
-    // SignerInfo.digestAlgorithm of the messageDigest attr.
+    // Cross-check messageDigest. For a detached CMS/PAdES signature it is the
+    // digest of the ByteRange. For a document timestamp the CMS eContent IS
+    // the TSTInfo, so messageDigest covers that TSTInfo and the ByteRange
+    // digest is checked later against TSTInfo.messageImprint. Comparing the
+    // two directly is a false "document was modified" on every valid
+    // DocTimeStamp. The digest algorithm is SignerInfo.digestAlgorithm (the
+    // PSS hash for RSA-PSS; Ed25519/Ed448 still use digestAlgorithm).
     const mdAttr = findAttr(si.signedAttrs, OID.messageDigestAttr);
     if (!mdAttr) throw new Error("messageDigest attribute missing");
     const expectedMd = mdAttr.valueBytes;
     const mdHashName = verifyParams.hashName || (DIGEST_INFO[si.digestAlgOid] && DIGEST_INFO[si.digestAlgOid].name);
     if (!mdHashName) throw new Error("cannot determine digest for messageDigest cross-check");
-    const actualMd = await digestBytes(mdHashName, sig.signedRegion);
-    if (!bytesEq(expectedMd, actualMd)) {
-      throw new Error(`messageDigest (${mdHashName}) does not match ByteRange digest — document was modified after signing`);
+    let actualMd;
+    let mdCovers;
+    if (isDocTs) {
+      const tstInfoBytes = extractEContentOctets(sig.cmsDer);
+      if (!tstInfoBytes) throw new Error("document timestamp is missing its encapsulated TSTInfo");
+      actualMd = await digestBytes(mdHashName, tstInfoBytes);
+      signerDigest = { name: mdHashName, hex: toHex(actualMd) };
+      if (!bytesEq(expectedMd, actualMd)) {
+        throw new Error(`messageDigest (${mdHashName} = ${signerDigest.hex.slice(0, 16)}…) does not match digest of encapsulated TSTInfo`);
+      }
+      mdCovers = "encapsulated TSTInfo";
+    } else {
+      actualMd = await digestBytes(mdHashName, sig.signedRegion);
+      if (!bytesEq(expectedMd, actualMd)) {
+        throw new Error(`messageDigest (${mdHashName}) does not match ByteRange digest — document was modified after signing`);
+      }
+      mdCovers = "ByteRange";
     }
     cmsOk = true;
     const algLabel = describeAlg(verifyParams, spkiInfo);
@@ -1888,14 +2428,27 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
         extras.push(`SubFilter is ETSI.CAdES.detached (declares PAdES) yet carries no signingCertificate(V2) attribute — NOT PAdES-conformant (ETSI EN 319 122-1 §5.2.2 makes signingCertificateV2 mandatory); ${sidNote}`);
       } else if (subFilter && subFilter.startsWith("adbe.")) {
         extras.push(`legacy Adobe PKCS#7 signature (SubFilter ${subFilter}) — valid CMS, but not a PAdES signature: no signingCertificate(V2) attribute (optional for this SubFilter, mandatory for PAdES), so ${sidNote}`);
+      } else if (isDocTs) {
+        extras.push(`document timestamp without a signingCertificate(V2) attribute — the TSA certificate is bound only by SignerInfo.sid; ${sidNote}`);
       } else {
         extras.push(`no signingCertificate(V2) attribute present — basic CMS, not PAdES-conformant; ${sidNote}`);
       }
     }
     extras.push(`contentType attr = ${ctValOid}`);
-    cmsDetail = `${algLabel} over SignedAttributes verifies against leaf SPKI; messageDigest attr matches ${mdHashName}(ByteRange) (${toHex(actualMd).slice(0, 16)}…); ${extras.join("; ")}.`;
+    const signerLabel = isDocTs ? "the TSA certificate" : "leaf SPKI";
+    cmsDetail = `${algLabel} over SignedAttributes verifies against ${signerLabel}; messageDigest attr matches ${mdHashName}(${mdCovers}) (${toHex(actualMd).slice(0, 16)}…); ${extras.join("; ")}.`;
   } catch (e) {
     cmsDetail = "FAILED: " + e.message;
+  }
+  // An empty signature dictionary must not become a silent green pass.
+  // docTsMismatch already failed CMS above when the token walk claimed a
+  // document timestamp. Any other unparsed dictionary is a warning. The
+  // warning does not clear cmsOk: cryptographic success still decides
+  // whether an unauthenticated attribute (the OpenTimestamps anchor) can
+  // fail the document.
+  if (sig.dictUnparsed && cmsState !== "fail") {
+    cmsState = "warn";
+    cmsDetail += " Signature dictionary could not be parsed; /Type and /SubFilter were not read, so this is not a clean pass.";
   }
 
   // ---- Check 2: certificate chain.
@@ -1907,6 +2460,8 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
   let chainState = "fail";
   let chainOk = false;
   let chainDetail = "";
+  let tsaUnanchored = false;
+  let caArchivedSha256 = null;
   try {
     const selfSigned = bytesEq(leaf.issuerDer, leaf.subjectDer);
     if (selfSigned) {
@@ -1931,10 +2486,21 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
         chainDetail = `⚠ Leaf cert is SELF-SIGNED (issuer == subject = "${leaf.subjectString}"). Its self-signature is internally consistent (${sigCheck.detail}), but ANY identity claim in this cert — the typed name, the SAN email — is asserted by the signer themselves with NO third party vouching. Treat the displayed signer identity as un-verified unless you separately confirm you trust the cert's fingerprint out of band.`;
       }
     } else if (!ca) {
-      // We can't cryptographically verify the chain without the issuer cert,
-      // but we CAN report the bind shape so the user knows what to look up.
-      chainState = "info";
-      chainDetail = `Leaf cert subject "${leaf.subjectString}", issuer "${leaf.issuerString}". Intermediate / root NOT embedded in CMS — for AATL- or EUTL-anchored signatures the chain terminates in the verifier's local trust store. This page cannot complete path validation without the issuer cert; treat this as "structure looks plausible, trust depends on whether you have the issuer in your local store".`;
+      if (isDocTs) {
+        // No embedded issuer means we cannot anchor the TSA either. `info`
+        // counts as a core pass and would paint the green banner. A document
+        // timestamp with no trust root stays the same warning as one whose
+        // embedded issuer is not in a trust store this verifier holds.
+        tsaUnanchored = true;
+        chainState = "warn";
+        chainOk = false;
+        chainDetail = `Leaf cert subject "${leaf.subjectString}", issuer "${leaf.issuerString}". The TSA issuer certificate is not embedded, so the chain cannot be completed. This verifier holds no AATL/EUTL trust store, so the TSA is not trust-anchored. The timestamp's CMS signature can still be checked against the leaf; trusting that TSA is a policy decision.`;
+      } else {
+        // We can't cryptographically verify the chain without the issuer cert,
+        // but we CAN report the bind shape so the user knows what to look up.
+        chainState = "info";
+        chainDetail = `Leaf cert subject "${leaf.subjectString}", issuer "${leaf.issuerString}". Intermediate / root NOT embedded in CMS — for AATL- or EUTL-anchored signatures the chain terminates in the verifier's local trust store. This page cannot complete path validation without the issuer cert; treat this as "structure looks plausible, trust depends on whether you have the issuer in your local store".`;
+      }
     } else {
       if (!bytesEq(leaf.issuerDer, ca.subjectDer)) throw new Error("leaf.issuer DN != embedded CA cert subject DN");
       // Cryptographically verify the leaf's signature against the CA's
@@ -1950,11 +2516,21 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
       // otherwise satisfy the signature check above.
       if (!ca.basicConstraintsCa) throw new Error("embedded CA cert is missing basicConstraints.cA=TRUE");
       if (!ca.keyUsageKeyCertSign) throw new Error("embedded CA cert is missing keyUsage.keyCertSign");
-      const expectedFreeSignCaSha256 = await fetchExpectedFreeSignCaSha256();
-      if (expectedFreeSignCaSha256) {
-        const caSha256 = toHex(await sha256(ca.der));
-        if (caSha256 !== expectedFreeSignCaSha256) {
-          throw new Error("embedded CA cert does not match this deployment's pinned FreeSign CA fingerprint");
+      // The FreeSign CA pin is the trust anchor for *signer* certificates this
+      // deployment issued. A document timestamp's signer is a TSA (DigiCert,
+      // a private test TSA, …). Pinning that issuer to the FreeSign list fails
+      // every third-party DocTimeStamp in the browser, where the pin is loaded.
+      // The TSA chain is still checked cryptographically above; public-list
+      // membership (AATL / EUTL) stays a policy decision, same as Check 3.
+      if (!isDocTs) {
+        const trustedFreeSignCas = await fetchTrustedFreeSignCas();
+        if (trustedFreeSignCas) {
+          const caSha256 = toHex(await sha256(ca.der));
+          const caStatus = trustedFreeSignCas.get(caSha256);
+          if (!caStatus) {
+            throw new Error("embedded CA cert does not match this deployment's pinned FreeSign CA fingerprint");
+          }
+          if (caStatus === "archived") caArchivedSha256 = caSha256;
         }
       }
       // PAdES: when a TST is present, the AUTHORITATIVE signing time is
@@ -1964,46 +2540,44 @@ async function verifySignature(sig, { skipOtsCalendarUpgrade = false } = {}) {
         if (trustTime < leaf.notBefore || trustTime > leaf.notAfter) throw new Error("leaf cert not valid at signing time " + trustTime.toISOString());
         if (trustTime < ca.notBefore || trustTime > ca.notAfter) throw new Error("CA cert not valid at signing time " + trustTime.toISOString());
       }
-      chainState = "ok";
-      chainOk = true;
-      const timeSource = tstSignedAt ? `TST genTime ${tstSignedAt.toISOString()} (authoritative)` : (signerClaimedAt ? `signer-claimed ${signerClaimedAt.toISOString()} (no TST, unattested)` : "no signing time available");
+      const timeSource = tstSignedAt
+        ? (isDocTs
+          ? `document timestamp genTime ${tstSignedAt.toISOString()} (authoritative for the token)`
+          : `TST genTime ${tstSignedAt.toISOString()} (authoritative)`)
+        : (signerClaimedAt ? `signer-claimed ${signerClaimedAt.toISOString()} (no TST, unattested)` : "no signing time available");
       chainDetail = `Leaf signature verifies against embedded CA pubkey (${sigCheck.detail}). DN match on Issuer/Subject. Leaf validity: ${leaf.notBefore.toISOString()} → ${leaf.notAfter.toISOString()}. Checked against: ${timeSource}.`;
+      if (isDocTs) {
+        // Cryptographic path validation is not a trust anchor. This verifier
+        // has no AATL/EUTL store, and the FreeSign signer-CA pin does not
+        // apply to a TSA. A green "third-party attested" result would claim
+        // a trust decision we did not make. Warn, the same way an unanchored
+        // signer chain withholds a clean pass.
+        tsaUnanchored = true;
+        chainState = "warn";
+        chainOk = false;
+        chainDetail += " Document-timestamp TSA chain: the embedded issuer's signature was checked and is not compared to this deployment's FreeSign signing CA. This verifier holds no AATL/EUTL trust store, so the TSA is not trust-anchored. The timestamp is cryptographically valid; trusting that TSA is a policy decision.";
+      } else {
+        chainState = "ok";
+        chainOk = true;
+      }
+      if (caArchivedSha256) {
+        chainDetail += ` Issuing CA is an ARCHIVED FreeSign CA (SHA-256 ${caArchivedSha256}) — retired from signing after a CA rotation, still trusted for verifying documents it signed.`;
+      }
     }
   } catch (e) {
     chainDetail = "FAILED: " + e.message;
   }
 
-async function fetchExpectedFreeSignCaSha256() {
-  // Browser /verify runs on the same origin that serves the deployment's
-  // FreeSign CA fingerprint. Node-based unit tests import this module without
-  // a browser location; keep those deterministic and skip the live pin there.
-  if (typeof window === "undefined" || typeof fetch !== "function") return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 3000);
-  try {
-    const res = await fetch("/.well-known/free-sign-signing-ca.sha256.txt", {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const fp = (await res.text()).trim().toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(fp)) throw new Error("malformed fingerprint response");
-    return fp;
-  } catch (e) {
-    throw new Error("could not load pinned FreeSign CA fingerprint: " + e.message);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
-  // ---- Check 3: RFC 3161 timestamp (PAdES-B-T).
-  // A TST is itself a CMS SignedData with eContentType id-ct-TSTInfo. To say
-  // anything trustworthy about it we must verify:
-  //   (a) messageImprint == digest(outer SignerInfo.signature), with the
-  //       digest algorithm the TSTInfo declares (not assumed SHA-256);
-  //   (b) the TST's own SignerInfo signature verifies against the embedded
-  //       TSA cert's public key — same dispatch as the outer SignerInfo;
-  //   (c) the TSA cert is valid at TSTInfo.genTime.
+  // ---- Check 3: RFC 3161 timestamp (PAdES-B-T), or a PDF document timestamp.
+  // A signature-time-stamp is an unsignedAttr whose TST messageImprint is
+  // digest(outer SignerInfo.signature). A document timestamp (/DocTimeStamp,
+  // /SubFilter /ETSI.RFC3161, eContentType id-ct-TSTInfo) has no such
+  // attribute: the CMS itself is the TimeStampToken, and messageImprint is
+  // the digest of the ByteRange. The imprint hash is the one TSTInfo
+  // declares, not assumed SHA-256. Either form also requires the TST
+  // SignerInfo signature to verify against the embedded TSA cert, and that
+  // cert to be valid at TSTInfo.genTime.
   // (Trust-root validation of the TSA cert chain is delegated — Adobe Reader
   // has DigiCert/Sectigo/etc. in its store; this page reports the TSA cert
   // subject and lets the user / their downstream policy decide.)
@@ -2012,7 +2586,42 @@ async function fetchExpectedFreeSignCaSha256() {
   let tstOk = false;
   let tstDetail = "";
   try {
-    if (!tstAttrEarly) {
+    if (docTsMismatch) throw new Error(DOC_TS_CONTENT_MISMATCH);
+    if (isDocTs) {
+      // The signature dictionary's /Contents is the TimeStampToken. There is
+      // no outer CAdES signature and no signature-time-stamp unsignedAttr:
+      // messageImprint binds the token to the ByteRange, and the CMS
+      // signature (Check 1, repeated here against the TSA cert) binds the
+      // TSA to the TSTInfo. The imprint hash is independent of the CMS
+      // signer digest recorded in signerDigest.
+      const tstInfo = tstInfoEarly || extractTstInfo(sig.cmsDer);
+      const imprintHashInfo = DIGEST_INFO[tstInfo.imprintHashOid];
+      if (!imprintHashInfo) throw new Error("unsupported document timestamp messageImprint hash OID " + tstInfo.imprintHashOid);
+      const docDigest = await digestBytes(imprintHashInfo.name, sig.signedRegion);
+      const imprintHex = toHex(tstInfo.imprint);
+      const signerNote = signerDigest
+        ? `CMS signer digest ${signerDigest.name} = ${signerDigest.hex.slice(0, 16)}…`
+        : "CMS signer digest was not established";
+      if (!bytesEq(tstInfo.imprint, docDigest)) {
+        throw new Error(`document timestamp messageImprint (${imprintHashInfo.name} = ${imprintHex.slice(0, 16)}…) does not match ${imprintHashInfo.name}(ByteRange) — document was modified after the timestamp. ${signerNote}`);
+      }
+      const tsaCheck = await verifyInnerCmsSignature(cms, sig.cmsDer);
+      if (!tsaCheck.ok) throw new Error("document timestamp SignerInfo signature did not verify: " + tsaCheck.detail);
+      if (!tsaCheck.signerCert) throw new Error("document timestamp has no TSA certificate");
+      assertTsaTimeStampingEku(tsaCheck.signerCert);
+      const genTime = tstInfo.genTime || tstSignedAt;
+      if (genTime && tsaCheck.signerCert) {
+        const tsa = tsaCheck.signerCert;
+        if (genTime < tsa.notBefore || genTime > tsa.notAfter) {
+          throw new Error("TSA cert not valid at document timestamp genTime " + genTime.toISOString());
+        }
+      }
+      if (genTime) tstSignedAt = genTime;
+      const tsaSubject = tsaCheck.signerCert ? tsaCheck.signerCert.subjectString : "(no TSA cert embedded)";
+      tstState = "ok";
+      tstOk = true;
+      tstDetail = `RFC 3161 document timestamp cryptographically verified. TSA: ${tsaSubject}. genTime: ${genTime ? genTime.toISOString() : "(unparsed)"}. ${signerNote}. messageImprint ${imprintHashInfo.name} = ${imprintHex.slice(0, 16)}… matches ${imprintHashInfo.name}(ByteRange). Timestamp token signature: ${tsaCheck.detail}. A document timestamp is the TimeStampToken itself (eContentType id-ct-TSTInfo): the CMS signer digest covers the encapsulated TSTInfo, and TSTInfo.messageImprint covers the signed revision. Those two digests are independent. Trust-anchor decision for the TSA cert (AATL / EUTL / private trust list) is left to the verifier's policy layer.`;
+    } else if (!tstAttrEarly) {
       tstState = "info";
       tstDetail = "No RFC 3161 TimeStampToken embedded. This is a PAdES-B-B signature — valid PAdES, just without an embedded TSA timestamp. The signingTime attribute (if present) is signer-claimed, not third-party attested. Many B-B signatures get an LTV/T upgrade later.";
     } else {
@@ -2406,12 +3015,22 @@ async function fetchExpectedFreeSignCaSha256() {
       signerEmail: leaf.rfc822Name || "(none in cert)",
       signerContact: sigDictContact || "(none)",
       signingTime: displayTime ? displayTime.toISOString() : "(unknown)",
-      signingTimeSource: tstSignedAt ? "TST (third-party attested)" : (signerClaimedAt ? "signer-claimed (unattested)" : "(unknown)"),
+      signingTimeSource: isDocTs && tstSignedAt
+        ? "document timestamp (cryptographically valid; TSA not trust-anchored)"
+        : (tstSignedAt ? "TST (third-party attested)" : (signerClaimedAt ? "signer-claimed (unattested)" : "(unknown)")),
       byteRangeSha256: toHex(byteRangeDigest),
-      cmsProfile: tstOk ? "PAdES-B-T" : "PAdES-B-B",
+      // A document timestamp is not a PAdES-B-B/B-T signature. On its own it
+      // is just a document timestamp; covering an earlier signature (or an
+      // earlier document timestamp) is the archival half of PAdES-B-LTA.
+      cmsProfile: isDocTs
+        ? (sig.coversPriorSignature ? "PAdES-B-LTA document timestamp" : "document timestamp")
+        : (tstOk ? "PAdES-B-T" : "PAdES-B-B"),
+      documentTimestamp: isDocTs,
       sigAlg: sigAlgLabel,
       caSubject: ca ? ca.subjectString : (chainState === "info" ? "(not embedded — verify externally)" : "(missing)"),
+      ...(caArchivedSha256 ? { caArchived: true, caSha256: caArchivedSha256 } : {}),
       platformSeal: looksLikePlatformSeal(leaf),
+      ...(tsaUnanchored ? { tsaUnanchored: true } : {}),
     },
     checks: {
       cms:   { ok: cmsOk,   state: cmsState,   detail: cmsDetail },
@@ -2720,6 +3339,7 @@ export {
   extractSignatures, verifySignature, parseCms, parseCertificate,
   OID, DIGEST_INFO, SIGALG_INFO, CURVE_INFO,
   setBlockstreamLookupEnabled,
+  setTrustedFreeSignCas,
   findBitcoinAttestation,
   tryUpgradeOtsTimestamp,
   evaluateEmbeddedOtsProof,
@@ -2752,6 +3372,97 @@ if (typeof document === "undefined") {
   // this module purely for extractSignatures + verifySignature (the post-seal
   // self-check) and must NOT trigger the verifier's drop-zone UI wiring.
   bindUi();
+}
+
+// Earlier-revision banner. A broken document timestamp fails on
+// TSTInfo.messageImprint, not on the CMS messageDigest, so the banner has to
+// read the timestamp check as well as the CMS check. Exported for the
+// regression test; the /verify status line uses the same classification.
+export function classifyEarlierRevision(result) {
+  const cmsDetail = result?.checks?.cms?.detail || "";
+  const tstDetail = result?.checks?.tst?.detail || "";
+  const chainDetail = result?.checks?.chain?.detail || "";
+  const cmsTampered = result?.checks?.cms?.state === "fail"
+    && /messageDigest|signature verification failed|unsigned bytes were appended|ByteRange starts after offset 0/i.test(cmsDetail);
+  // A signature-time-stamp imprint covers the outer CMS signature, not the
+  // ByteRange. Only a document-timestamp imprint mismatch means the signed
+  // revision was modified.
+  const docTsTampered = result?.summary?.documentTimestamp === true
+    && result?.checks?.tst?.state === "fail"
+    && /document timestamp messageImprint|modified after the timestamp/i.test(tstDetail);
+  const chainForged = result?.checks?.chain?.state === "fail"
+    && /signature did not verify|signature failed cryptographic/i.test(chainDetail);
+  const chainExpired = result?.checks?.chain?.state === "fail"
+    && /not valid at signing time/i.test(chainDetail);
+  if (cmsTampered || docTsTampered || chainForged) {
+    const detail = cmsTampered ? cmsDetail : (docTsTampered ? tstDetail : chainDetail);
+    return { kind: "tampered", detail };
+  }
+  if (chainExpired) return { kind: "expired", detail: chainDetail };
+  return null;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+export function updateAatlTile(block, result) {
+  const el = block.querySelector("[data-check='aatl']");
+  if (!el) return;
+  const body = el.children[1];
+  if (!body) return;
+  const caSubject = (result.summary && result.summary.caSubject) || "";
+  const chainState = result.checks && result.checks.chain && result.checks.chain.state;
+  const isFreeSign = /FreeSign CA/i.test(caSubject);
+
+  // A document-timestamp chain warning means the TSA is not trust-anchored.
+  // It is not a self-signed signer leaf (a CA-issued DigiCert TSA is the
+  // usual case). Same split as the status banner and the chain tile.
+  if (result.summary && result.summary.tsaUnanchored) {
+    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
+      <p>The TSA certificate chain is not anchored to a trust root this verifier holds. This page has no AATL/EUTL store, so it does not decide whether Adobe Reader will trust that timestamp authority. The timestamp can still be cryptographically valid.</p>
+      <div class="verify-cta-row">
+        <a href="/faq#adobe">Why Adobe trust status is separate from cryptographic validity</a>
+      </div>`;
+    return;
+  }
+  // Self-signed leaf — there's no third-party issuer for AATL to vouch for;
+  // recipient must trust the cert fingerprint out of band.
+  if (chainState === "warn") {
+    const isSeal = !!(result.summary && result.summary.platformSeal);
+    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
+      <p>${isSeal
+        ? "This document carries the <strong>FreeSign platform e-seal</strong> on a self-signed certificate. AATL is a list of trusted third-party CAs &mdash; it doesn't apply to an organisational seal. Adobe Reader will show a yellow triangle; a recipient confirms the seal is genuinely FreeSign's by checking its certificate fingerprint out of band."
+        : "This signer used a <strong>self-signed certificate</strong>. AATL is a list of trusted third-party CAs &mdash; it doesn't apply here. Adobe Reader will show a yellow triangle, and there is no &ldquo;add this CA to AATL&rdquo; path. The recipient has to explicitly trust the cert fingerprint out of band before Reader will go green."}</p>
+      <div class="verify-cta-row">
+        <a href="/faq#adobe">Why yellow &ne; invalid for self-signed</a>
+      </div>`;
+    return;
+  }
+  // CA not embedded in the CMS (chain state = info) — we can't say anything
+  // about AATL membership without the issuer cert.
+  if (chainState === "info" || !caSubject || /^\(/.test(caSubject)) {
+    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
+      <p>This signature's issuer cert isn't embedded in the CMS, so this page can't report on AATL membership directly. Adobe Reader will use its local trust store to decide whether to show green or yellow &mdash; depends on what's installed locally / shipped in the Reader AATL bundle.</p>
+      <div class="verify-cta-row">
+        <a href="/faq#adobe">Why Adobe trust status is separate from cryptographic validity</a>
+      </div>`;
+    return;
+  }
+  if (isFreeSign) {
+    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
+      <p>Adobe Reader shows a yellow triangle because the <strong>FreeSign CA</strong> is not on the Adobe Approved Trust List. The signature is cryptographically valid &mdash; this is a UX warning about issuer recognition, not a verification failure. Repeat recipients can add the FreeSign CA to local Adobe trust:</p>
+      <div class="verify-cta-row">
+        <a class="button-primary" href="/guides/trust-freesign-in-adobe">FreeSign Adobe Trust Setup</a>
+        <a href="/faq#adobe">Why yellow &ne; invalid</a>
+      </div>`;
+    return;
+  }
+  body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
+    <p>Whether this signature shows a green check in Adobe Reader depends on whether <strong>${escapeHtml(caSubject)}</strong> is on the Adobe Approved Trust List (AATL) or in your local Adobe trust store. This page does not make AATL trust decisions &mdash; ask your Adobe Reader or check Adobe&rsquo;s AATL listing directly. The cryptographic checks above are independent of AATL.</p>
+    <div class="verify-cta-row">
+      <a href="/faq#adobe">Why Adobe trust status is separate from cryptographic validity</a>
+    </div>`;
 }
 
 function bindUi() {
@@ -2880,19 +3591,31 @@ function camelToKebab(s) {
 
 function renderResultIntoBlock(block, result) {
   fillSummary(block, result.summary);
+  const docTs = !!(result.summary && result.summary.documentTimestamp);
   const cmsSummary = {
-    ok:   `${result.summary.sigAlg} verified; messageDigest matches the ByteRange digest.`,
+    ok:   docTs
+      ? `${result.summary.sigAlg} verified; messageDigest matches the encapsulated TSTInfo.`
+      : `${result.summary.sigAlg} verified; messageDigest matches the ByteRange digest.`,
     fail: "Signature failed to verify — see details.",
     info: "Signature not evaluated.",
     warn: "Signature verified with caveats — see details.",
   };
   const chainSummary = {
-    ok:   `Leaf chains to "${result.summary.caSubject}"; signature on TBSCertificate verifies; validity windows cover the signing time.`,
+    ok:   `Leaf chains to "${result.summary.caSubject}"${result.summary.caArchived ? " (archived FreeSign CA — retired from signing, still trusted for verification)" : ""}; signature on TBSCertificate verifies; validity windows cover the signing time.`,
     fail: "Chain check failed — see details.",
     info: "Leaf cert present; intermediate / root not embedded in CMS. Common for AATL-anchored signatures.",
-    warn: "Self-signed leaf — identity claims in the cert are NOT third-party-attested.",
+    warn: result.summary?.tsaUnanchored
+      ? (result.summary.caSubject && !/^\(/.test(result.summary.caSubject)
+        ? `TSA certificate cryptographically verifies against "${result.summary.caSubject}", but that issuer is not a trust anchor this verifier holds.`
+        : "TSA certificate chain is not anchored to a trust root this verifier holds.")
+      : "Self-signed leaf — identity claims in the cert are NOT third-party-attested.",
   };
-  const tstSummary = {
+  const tstSummary = docTs ? {
+    ok:   "RFC 3161 document timestamp verified; messageImprint matches the ByteRange digest.",
+    fail: "Document timestamp is present but broken — see details.",
+    info: "Document timestamp could not be evaluated.",
+    warn: "Document timestamp present with caveats — see details.",
+  } : {
     ok:   "RFC 3161 timestamp present and verified against the outer signature.",
     fail: "RFC 3161 timestamp is present but broken — see details.",
     info: "No RFC 3161 timestamp embedded (PAdES-B-B). Valid PAdES — just no third-party attested signing time.",
@@ -2964,6 +3687,7 @@ async function handleFile(file) {
     let allCoreOk = true;
     let anyCaveat = false; // a non-fatal warn (e.g. self-signed leaf) — green banner is withheld
     let anyIdentityCaveat = false; // a caveat on the certificate chain (self-asserted / not trust-anchored identity)
+    let anyTsaUnanchored = false; // document timestamp whose TSA is not on a trust root this verifier holds
     // Envelope ids pulled from embedded FreeSign evidence records — handed to
     // verify-audit.js after the loop so it can fetch + re-verify the audit
     // chain. All signers of one document share one envelope, so this collects
@@ -3002,18 +3726,19 @@ async function handleFile(file) {
         const sigCaveat = FATAL_CHECK_NAMES.some((name) => result.checks[name]?.state === "warn");
         if (sigFail) anyFail = true;
         if (sigCaveat) anyCaveat = true;
-        if (result.checks.chain.state === "warn") anyIdentityCaveat = true;
+        if (result.checks.chain.state === "warn") {
+          if (result.summary?.tsaUnanchored) anyTsaUnanchored = true;
+          else anyIdentityCaveat = true;
+        }
         if (!sigCoreOk) allCoreOk = false;
         // Surface earlier-revision tampering vs cert-expiry separately:
         // tampering breaks documents, expiry is normal long-lived aging.
         if (i < sigs.length - 1) {
-          const cmsTampered = result.checks.cms.state === "fail" && /messageDigest|signature verification failed/i.test(result.checks.cms.detail);
-          const chainForged = result.checks.chain.state === "fail" && /signature did not verify|signature failed cryptographic/i.test(result.checks.chain.detail);
-          const chainExpired = result.checks.chain.state === "fail" && /not valid at signing time/i.test(result.checks.chain.detail);
-          if (!priorBroken && (cmsTampered || chainForged)) {
-            priorBroken = { index: i + 1, total: sigs.length, detail: result.checks.cms.detail || result.checks.chain.detail };
-          } else if (!priorExpired && chainExpired) {
-            priorExpired = { index: i + 1, total: sigs.length, detail: result.checks.chain.detail };
+          const earlier = classifyEarlierRevision(result);
+          if (!priorBroken && earlier && earlier.kind === "tampered") {
+            priorBroken = { index: i + 1, total: sigs.length, detail: earlier.detail };
+          } else if (!priorExpired && earlier && earlier.kind === "expired") {
+            priorExpired = { index: i + 1, total: sigs.length, detail: earlier.detail };
           }
         }
       } catch (e) {
@@ -3047,6 +3772,9 @@ async function handleFile(file) {
       if (anyIdentityCaveat) {
         setStatus(`Verification complete — ${intact}, but at least one uses a self-signed certificate whose identity is NOT third-party-attested. Expand the certificate-chain tile and confirm the signer identity out of band before trusting it. Other yellow tiles, if any, carry further caveats.`, "warn");
         setPanelStatus("Cryptographically intact — review identity (self-asserted / not trust-anchored)", "REVIEW");
+      } else if (anyTsaUnanchored) {
+        setStatus(`Verification complete — ${intact}, but the document timestamp's TSA is not trust-anchored. The token is cryptographically valid; this verifier holds no AATL/EUTL store, so trusting that TSA is a policy decision. Expand the certificate-chain tile.`, "warn");
+        setPanelStatus("Cryptographically valid — TSA not trust-anchored", "REVIEW");
       } else {
         setStatus(`Verification complete — ${intact}, but at least one carries a caveat. Expand the yellow tiles for details.`, "warn");
         setPanelStatus("Cryptographically intact — review the caveats", "REVIEW");
@@ -3075,58 +3803,6 @@ function formatBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(2)} MB`;
-}
-
-function updateAatlTile(block, result) {
-  const el = block.querySelector("[data-check='aatl']");
-  if (!el) return;
-  const body = el.children[1];
-  if (!body) return;
-  const caSubject = (result.summary && result.summary.caSubject) || "";
-  const chainState = result.checks && result.checks.chain && result.checks.chain.state;
-  const isFreeSign = /FreeSign CA/i.test(caSubject);
-
-  // Self-signed leaf — there's no third-party issuer for AATL to vouch for;
-  // recipient must trust the cert fingerprint out of band.
-  if (chainState === "warn") {
-    const isSeal = !!(result.summary && result.summary.platformSeal);
-    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
-      <p>${isSeal
-        ? "This document carries the <strong>FreeSign platform e-seal</strong> on a self-signed certificate. AATL is a list of trusted third-party CAs &mdash; it doesn't apply to an organisational seal. Adobe Reader will show a yellow triangle; a recipient confirms the seal is genuinely FreeSign's by checking its certificate fingerprint out of band."
-        : "This signer used a <strong>self-signed certificate</strong>. AATL is a list of trusted third-party CAs &mdash; it doesn't apply here. Adobe Reader will show a yellow triangle, and there is no &ldquo;add this CA to AATL&rdquo; path. The recipient has to explicitly trust the cert fingerprint out of band before Reader will go green."}</p>
-      <div class="verify-cta-row">
-        <a href="/faq#adobe">Why yellow &ne; invalid for self-signed</a>
-      </div>`;
-    return;
-  }
-  // CA not embedded in the CMS (chain state = info) — we can't say anything
-  // about AATL membership without the issuer cert.
-  if (chainState === "info" || !caSubject || /^\(/.test(caSubject)) {
-    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
-      <p>This signature's issuer cert isn't embedded in the CMS, so this page can't report on AATL membership directly. Adobe Reader will use its local trust store to decide whether to show green or yellow &mdash; depends on what's installed locally / shipped in the Reader AATL bundle.</p>
-      <div class="verify-cta-row">
-        <a href="/faq#adobe">Why Adobe trust status is separate from cryptographic validity</a>
-      </div>`;
-    return;
-  }
-  if (isFreeSign) {
-    body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
-      <p>Adobe Reader shows a yellow triangle because the <strong>FreeSign CA</strong> is not on the Adobe Approved Trust List. The signature is cryptographically valid &mdash; this is a UX warning about issuer recognition, not a verification failure. Repeat recipients can add the FreeSign CA to local Adobe trust:</p>
-      <div class="verify-cta-row">
-        <a class="button-primary" href="/guides/trust-freesign-in-adobe">FreeSign Adobe Trust Setup</a>
-        <a href="/faq#adobe">Why yellow &ne; invalid</a>
-      </div>`;
-    return;
-  }
-  body.innerHTML = `<h3>Adobe Reader AATL trust</h3>
-    <p>Whether this signature shows a green check in Adobe Reader depends on whether <strong>${escapeHtml(caSubject)}</strong> is on the Adobe Approved Trust List (AATL) or in your local Adobe trust store. This page does not make AATL trust decisions &mdash; ask your Adobe Reader or check Adobe&rsquo;s AATL listing directly. The cryptographic checks above are independent of AATL.</p>
-    <div class="verify-cta-row">
-      <a href="/faq#adobe">Why Adobe trust status is separate from cryptographic validity</a>
-    </div>`;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
 
 els.dropzone.addEventListener("dragover", (e) => {

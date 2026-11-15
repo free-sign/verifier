@@ -100,6 +100,15 @@ export async function hasSessionKey(envelopeId) {
   return !!(existing && existing.privateKey && existing.publicKeyJwk);
 }
 
+// Read a session key without creating one. Finalize replay on a later visit
+// must not mint a new keypair: the server has the original JWK, and a fresh
+// key would fail invariant #11.
+export async function readSessionKey(envelopeId) {
+  const existing = await idbGet(envelopeId);
+  if (!existing?.privateKey || !existing?.publicKeyJwk) return null;
+  return { publicKeyJwk: existing.publicKeyJwk, privateKey: existing.privateKey };
+}
+
 /**
  * Produce a session signature for an envelope action. The Worker verifies the
  * same `canonicalJson({envelope_id, action, nonce, timestamp})` string.
