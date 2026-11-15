@@ -1,12 +1,17 @@
 # FreeSign Verifier
 
+![FreeSign Verifier — verify every signature yourself](assets/social-preview.png)
+
 The open-source verifier **library** for [FreeSign](https://free-sign.com)
 signed PDFs.
 
 This repository contains the **exact verification code** that runs at
 **[free-sign.com/verify](https://free-sign.com/verify)** — published so anyone
 can read it, audit it, and run it offline to check a FreeSign-signed PDF
-**without trusting the FreeSign service at all**.
+**yourself**. Document integrity, the CMS signature, the RFC 3161 timestamp, the
+OpenTimestamps anchors and the post-quantum co-signature are checked without
+relying on the FreeSign service; the certificate chain shows the signer identity
+(name + OTP-verified email) that the FreeSign CA vouched for.
 
 It is an ES-module library: no UI, no framework, no build step. It runs
 unchanged in a browser and in Node ≥ 18 (both provide the WebCrypto, `fetch`,

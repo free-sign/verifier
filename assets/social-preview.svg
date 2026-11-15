@@ -1,0 +1,92 @@
+<svg xml:space="preserve" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <!-- GitHub social preview for github.com/free-sign/verifier (1280x640).
+       Same visual language as public/og-image.svg.  -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7f5ef"/>
+      <stop offset="1" stop-color="#ede8da"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#126a5a"/>
+      <stop offset="1" stop-color="#0e574a"/>
+    </linearGradient>
+    <style>
+      .h { font: 700 74px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #171615; letter-spacing: -1px; }
+      .tag { font: 600 26px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #126a5a; letter-spacing: 4px; }
+      .sub { font: 400 29px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #67625c; }
+      .sub b { font-weight: 600; fill: #171615; }
+      .pill { font: 700 21px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #126a5a; }
+      .brand { font: 800 32px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #171615; }
+      .brand-sub { font: 500 32px Inter, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #8a847b; }
+      .mono { white-space: pre;  font: 500 17px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #d9e6e2; }
+      .mono-dim { font: 500 17px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #7f948e; }
+      .mono-ok { font: 700 17px "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; fill: #5fd3b3; }
+    </style>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1280" height="8" fill="url(#accent)"/>
+
+  <!-- Content scaled into GitHub's safe zone (80px border on 1280x640: x 80-1200, y 80-560) -->
+  <g transform="translate(26 20) scale(0.9375)">
+  <!-- Brand row -->
+  <g transform="translate(72, 64)">
+    <rect width="56" height="56" rx="10" fill="#ffffff" stroke="#ded8cc"/>
+    <text x="28" y="36" text-anchor="middle" class="pill" font-size="20">fs</text>
+    <text x="76" y="39" class="brand">free-sign<tspan class="brand-sub"> / </tspan>verifier</text>
+  </g>
+
+  <!-- Eyebrow -->
+  <text x="72" y="222" class="tag">OPEN SOURCE · MIT</text>
+
+  <!-- Headline -->
+  <text x="72" y="300" class="h">Verify every</text>
+  <text x="72" y="380" class="h">signature yourself.</text>
+
+  <!-- Tagline -->
+  <text x="72" y="448" class="sub">The exact code behind <tspan font-weight="600" fill="#171615">free-sign.com/verify</tspan>.</text>
+  <text x="72" y="488" class="sub">Runs locally — your PDF never leaves your machine.</text>
+
+  <!-- Pills -->
+  <g transform="translate(72, 532)">
+    <g>
+      <rect width="170" height="44" rx="22" fill="#ffffff" stroke="#bfd7d1" stroke-width="1.5"/>
+      <text x="85" y="29" text-anchor="middle" class="pill">PAdES / CMS</text>
+    </g>
+    <g transform="translate(186, 0)">
+      <rect width="200" height="44" rx="22" fill="#ffffff" stroke="#bfd7d1" stroke-width="1.5"/>
+      <text x="100" y="29" text-anchor="middle" class="pill">OpenTimestamps</text>
+    </g>
+    <g transform="translate(402, 0)">
+      <rect width="200" height="44" rx="22" fill="#ffffff" stroke="#bfd7d1" stroke-width="1.5"/>
+      <text x="100" y="29" text-anchor="middle" class="pill">ML-DSA (PQC)</text>
+    </g>
+    <g transform="translate(618, 0)">
+      <rect width="200" height="44" rx="22" fill="#ffffff" stroke="#bfd7d1" stroke-width="1.5"/>
+      <text x="100" y="29" text-anchor="middle" class="pill">Browser + Node</text>
+    </g>
+  </g>
+
+  <!-- Terminal card -->
+  <g transform="translate(866, 104)">
+    <rect width="350" height="300" rx="14" fill="#14211e"/>
+    <rect width="350" height="300" rx="14" fill="none" stroke="#0e574a" stroke-width="2"/>
+    <circle cx="24" cy="24" r="6" fill="#3b4f4a"/>
+    <circle cx="44" cy="24" r="6" fill="#3b4f4a"/>
+    <circle cx="64" cy="24" r="6" fill="#3b4f4a"/>
+    <text x="22" y="74" class="mono"><tspan class="mono-dim">$ </tspan>node verify-pdf.mjs \</text>
+    <text x="22" y="98" class="mono">    signed.pdf</text>
+    <text x="22" y="140" class="mono">CMS signature       <tspan class="mono-ok">✓</tspan></text>
+    <text x="22" y="168" class="mono">Certificate chain   <tspan class="mono-ok">✓</tspan></text>
+    <text x="22" y="196" class="mono">RFC 3161 timestamp  <tspan class="mono-ok">✓</tspan></text>
+    <text x="22" y="224" class="mono">OpenTimestamps      <tspan class="mono-ok">✓</tspan></text>
+    <text x="22" y="252" class="mono">Embedded evidence   <tspan class="mono-ok">✓</tspan></text>
+    <text x="22" y="280" class="mono">Post-quantum        <tspan class="mono-ok">✓</tspan></text>
+  </g>
+
+  <!-- Seal badge overlapping the terminal -->
+  <g transform="translate(1196, 404)">
+    <circle r="46" fill="#126a5a" stroke="#f7f5ef" stroke-width="6"/>
+    <path d="M -21 0 L -5 16 L 23 -12" stroke="#ffffff" stroke-width="7" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  </g>
+</svg>
