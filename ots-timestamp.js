@@ -171,7 +171,7 @@ async function deserializeTimestampAsync(buf, offset, initialMsg, recursionLimit
     const inner = buf[cursor.pos];
     cursor.pos += 1;
     await doTagOrAttestation(inner);
-    if (cursor.pos >= buf.length) return { stamp, offset: cursor.pos };
+    if (cursor.pos >= buf.length) throw new Error("timestamp missing final branch after 0xff");
     tag = buf[cursor.pos];
     cursor.pos += 1;
   }
